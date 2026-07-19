@@ -111,6 +111,11 @@ button { color: inherit; }
 .question-captures { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
 .question img { display: block; max-width: 120px; max-height: 85px; border-radius: 7px; object-fit: cover; }
 .answer { color: #27272d; font-size: 13px; line-height: 1.55; white-space: pre-wrap; user-select: text; }
+.answer.failed { color: #a71f3b; }
+.answer-pending { display: flex; align-items: center; gap: 4px; height: 20px; }
+.answer-pending span { width: 5px; height: 5px; border-radius: 50%; background: #0053fd; animation: pulse 1s infinite alternate; }
+.answer-pending span:nth-child(2) { animation-delay: .2s; }
+.answer-pending span:nth-child(3) { animation-delay: .4s; }
 .markdown { white-space: normal; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -120,10 +125,6 @@ button { color: inherit; }
 .markdown pre { overflow-x: auto; padding: 9px; border-radius: 8px; background: #eef3ff; }
 .markdown pre code { padding: 0; background: transparent; }
 .markdown a { color: #0053fd; }
-.thinking { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%); color: #666678; font-size: 11px; }
-.thinking span { display: inline-block; width: 4px; height: 4px; margin-right: 3px; border-radius: 50%; background: #0053fd; animation: pulse 1s infinite alternate; }
-.thinking span:nth-child(2) { animation-delay: .2s; }
-.thinking span:nth-child(3) { animation-delay: .4s; }
 @keyframes pulse { to { opacity: .2; transform: translateY(-2px); } }
 .error { position: fixed; left: 50%; top: 82px; transform: translateX(-50%); max-width: 560px; padding: 7px 10px; border: 1px solid rgba(199,46,77,.24); border-radius: 9px; background: #fff2f5; color: #a71f3b; font-size: 11px; }
 

@@ -4,10 +4,12 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart'
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import type { JSX } from 'solid-js'
-import { NEW_SESSION, newSessionSetting, normalizeSelection } from './selection'
+import { NEW_SESSION, normalizeSelection } from './selection'
 import { appendCapture, clipboardImageFiles, imageFileToCapture, removeCaptureAt, type Capture } from './captures'
 import { renderMarkdown } from './markdown'
 import { autostartAction } from './autostart'
+import { runHermesTurn } from './hermes-gateway'
+import { appendAnswerDelta, beginExchange, finishExchange, type Exchange } from './conversation'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = {
@@ -18,13 +20,8 @@ type Session = {
   last_active: number
 }
 
-type AskResponse = {
-  answer: string
-  session_id: string
-}
-
 type Selection = { x: number; y: number; width: number; height: number }
-type Exchange = { prompt: string; answer: string; images: Capture[] }
+type PreviousChat = { history: Exchange[]; activeSession: string; runtimeSession?: string }
 
 const SESSION_PREFERENCE_KEY = 'ask-hermes.session-preference.v2'
 const MODEL_KEY = 'ask-hermes.model'
@@ -43,10 +40,12 @@ function PromptWindow() {
     localStorage.getItem(SESSION_PREFERENCE_KEY) || NEW_SESSION,
   )
   const [activeSession, setActiveSession] = createSignal(sessionPreference())
+  const [runtimeSession, setRuntimeSession] = createSignal<string>()
   const [prompt, setPrompt] = createSignal('')
   const [captures, setCaptures] = createSignal<Capture[]>([])
   const [preview, setPreview] = createSignal<Capture>()
   const [history, setHistory] = createSignal<Exchange[]>([])
+  const [previousChat, setPreviousChat] = createSignal<PreviousChat>()
   const [busy, setBusy] = createSignal(false)
   const [capturing, setCapturing] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
@@ -63,6 +62,7 @@ function PromptWindow() {
       if (normalized !== sessionPreference()) {
         setSessionPreference(normalized)
         setActiveSession(normalized)
+        setRuntimeSession(undefined)
         localStorage.setItem(SESSION_PREFERENCE_KEY, normalized)
       }
     } catch (reason) {
@@ -71,6 +71,11 @@ function PromptWindow() {
   }
 
   const clearPrompt = () => {
+    const transcript = history()
+    if (transcript.length > 0) {
+      setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
+      void invoke('set_previous_chat_available', { available: true })
+    }
     promptGeneration += 1
     setPrompt('')
     setCaptures([])
@@ -80,6 +85,7 @@ function PromptWindow() {
     setCapturing(false)
     setSettingsOpen(false)
     setActiveSession(sessionPreference())
+    setRuntimeSession(undefined)
     setError('')
   }
 
@@ -90,6 +96,22 @@ function PromptWindow() {
     })
     const unlistenOpen = listen('open-prompt', () => {
       void loadSessions()
+      window.setTimeout(() => inputRef?.focus(), 20)
+    })
+    const unlistenPrevious = listen('open-previous-chat', () => {
+      const previous = previousChat()
+      if (!previous) return
+      promptGeneration += 1
+      setPrompt('')
+      setCaptures([])
+      setPreview(undefined)
+      setSettingsOpen(false)
+      setError('')
+      setBusy(false)
+      setCapturing(false)
+      setHistory(previous.history)
+      setActiveSession(previous.activeSession)
+      setRuntimeSession(previous.runtimeSession)
       window.setTimeout(() => inputRef?.focus(), 20)
     })
     const unlistenClear = listen('clear-prompt', clearPrompt)
@@ -106,6 +128,7 @@ function PromptWindow() {
     })
     onCleanup(() => void unlisten.then(dispose => dispose()))
     onCleanup(() => void unlistenOpen.then(dispose => dispose()))
+    onCleanup(() => void unlistenPrevious.then(dispose => dispose()))
     onCleanup(() => void unlistenClear.then(dispose => dispose()))
     onCleanup(() => void unlistenCapture.then(dispose => dispose()))
     onCleanup(() => void unlistenCaptureReady.then(dispose => dispose()))
@@ -127,27 +150,43 @@ function PromptWindow() {
     const question = prompt().trim() || 'What can you tell me about these screenshots?'
     const images = captures()
     const generation = promptGeneration
+    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const selectedSession = activeSession()
+    setHistory(items => beginExchange(items, { id: exchangeId, prompt: question, images }))
+    setPrompt('')
+    setCaptures([])
     setBusy(true)
     setError('')
     try {
-      const result = await invoke<AskResponse>('ask_hermes', {
-        prompt: prompt(),
-        sessionId: activeSession() === NEW_SESSION ? null : activeSession(),
-        imageDataUrls: images.map(image => image.data_url),
-        model: newSessionSetting(activeSession(), model() || null),
-        reasoningEffort: newSessionSetting(activeSession(), effort())
+      const result = await runHermesTurn({
+        exchangeId,
+        prompt: question,
+        images: images.map(image => image.data_url),
+        storedSessionId: selectedSession === NEW_SESSION ? undefined : selectedSession,
+        runtimeSessionId: runtimeSession(),
+        model: selectedSession === NEW_SESSION ? model() || undefined : undefined,
+        reasoningEffort: selectedSession === NEW_SESSION ? effort() || undefined : undefined,
+        onSession: (runtimeId, storedId) => {
+          if (generation !== promptGeneration) return
+          setRuntimeSession(runtimeId)
+          setActiveSession(storedId)
+        },
+        onDelta: text => {
+          if (generation !== promptGeneration) return
+          setHistory(items => appendAnswerDelta(items, exchangeId, text))
+        },
       })
       if (generation !== promptGeneration) return
-      setHistory(items => [...items, { prompt: question, answer: result.answer, images }])
-      setPrompt('')
-      setCaptures([])
-      if (result.session_id) setActiveSession(result.session_id)
+      setRuntimeSession(result.runtimeSessionId)
+      setActiveSession(result.storedSessionId)
+      setHistory(items => finishExchange(items, exchangeId, result.answer))
       await loadSessions()
       for (const delay of [1200, 3500, 8000]) {
         window.setTimeout(() => void loadSessions(), delay)
       }
     } catch (reason) {
-      setError(String(reason))
+      const message = String(reason)
+      setHistory(items => items.map(item => item.id === exchangeId ? { ...item, answer: item.answer || message, status: 'error' } : item))
     } finally {
       setBusy(false)
       window.setTimeout(() => inputRef?.focus(), 20)
@@ -200,7 +239,10 @@ function PromptWindow() {
       localStorage.setItem(SESSION_PREFERENCE_KEY, sessionPreference())
       localStorage.setItem(MODEL_KEY, model())
       localStorage.setItem(EFFORT_KEY, effort())
-      if (history().length === 0) setActiveSession(sessionPreference())
+      if (history().length === 0) {
+        setActiveSession(sessionPreference())
+        setRuntimeSession(undefined)
+      }
       setSettingsOpen(false)
     } catch (reason) {
       setError(String(reason))
@@ -251,7 +293,12 @@ function PromptWindow() {
                       </Show>
                       {item.prompt}
                     </div>
-                    <div class="answer markdown" innerHTML={renderMarkdown(item.answer)} />
+                    <Show when={item.answer}>
+                      <div class="answer markdown" classList={{ failed: item.status === 'error' }} innerHTML={renderMarkdown(item.answer)} />
+                    </Show>
+                    <Show when={item.status === 'pending' && !item.answer}>
+                      <div class="answer-pending" aria-label="Hermes is thinking"><span /><span /><span /></div>
+                    </Show>
                   </article>
                 )}
               </For>
@@ -296,9 +343,6 @@ function PromptWindow() {
             </button>
           </div>
 
-          <Show when={busy()}>
-            <div class="thinking"><span /><span /><span /> Hermes is thinking</div>
-          </Show>
           <Show when={error()}><div class="error">{error()}</div></Show>
           <Show when={preview()}>{capture => (
             <div class="capture-preview" role="dialog" aria-modal="true" aria-label="Screen capture preview" onMouseDown={event => {

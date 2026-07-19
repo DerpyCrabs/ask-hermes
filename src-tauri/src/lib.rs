@@ -1,15 +1,20 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use futures_util::{SinkExt, StreamExt};
 use image::{DynamicImage, ImageBuffer, ImageFormat, RgbaImage};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
-    env, fs,
-    io::Cursor,
+    env,
+    io::{BufRead, BufReader, Cursor},
     path::PathBuf,
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tauri::{
     image::Image,
@@ -18,6 +23,7 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
@@ -31,11 +37,51 @@ struct HermesSession {
     last_active: f64,
 }
 
-#[derive(Debug, Serialize)]
-struct AskResponse {
-    answer: String,
-    session_id: String,
+#[derive(Debug, Clone, Serialize)]
+struct HermesGatewayConnection {
+    ws_url: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+struct HermesSessionStarted {
+    exchange_id: String,
+    runtime_session_id: String,
+    stored_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HermesAnswerDelta {
+    exchange_id: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesTurnResponse {
+    answer: String,
+    runtime_session_id: String,
+    stored_session_id: String,
+}
+
+struct HermesBackendProcess {
+    child: Child,
+    connection: HermesGatewayConnection,
+}
+
+#[derive(Default)]
+struct HermesBackend(Mutex<Option<HermesBackendProcess>>);
+
+impl Drop for HermesBackend {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.0.get_mut() {
+            if let Some(backend) = slot.as_mut() {
+                let _ = backend.child.kill();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PreviousChatMenu(Mutex<Option<MenuItem<tauri::Wry>>>);
 
 #[derive(Debug, Serialize)]
 struct CaptureResponse {
@@ -100,7 +146,7 @@ fn hermes_binary() -> Result<PathBuf, String> {
             })
         })
         .ok_or_else(|| {
-            "Hermes CLI was not found. Start Hermes Desktop once, then retry.".to_string()
+            "Hermes Agent was not found. Start Hermes Desktop once, then retry.".to_string()
         })
 }
 
@@ -182,159 +228,301 @@ fn list_sessions() -> Result<Vec<HermesSession>, String> {
     query_sessions(30)
 }
 
-fn write_attachment(data_url: &str) -> Result<PathBuf, String> {
-    let encoded = data_url
-        .split_once(',')
-        .map(|(_, body)| body)
-        .ok_or_else(|| "Invalid screenshot data".to_string())?;
-    let bytes = STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("Invalid screenshot: {error}"))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let path = env::temp_dir().join(format!("ask-hermes-{stamp}.png"));
-    fs::write(&path, bytes).map_err(|error| format!("Could not save screenshot: {error}"))?;
-    Ok(path)
-}
-
-fn read_reasoning_effort(binary: &PathBuf) -> Result<String, String> {
-    let mut command = Command::new(binary);
+fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
+    let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let mut command = Command::new(hermes_binary()?);
     command
-        .arg("config")
-        .arg("get")
-        .arg("agent.reasoning_effort");
+        .args(["serve", "--host", "127.0.0.1", "--port", "0"])
+        .env("HERMES_DASHBOARD_SESSION_TOKEN", &token)
+        .env("HERMES_DESKTOP", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        command.current_dir(home);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("Could not read Hermes thinking effort: {error}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start the Hermes gateway: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Hermes gateway did not expose its startup output".to_string())?;
+    let mut reader = BufReader::new(stdout);
+    let port = loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = child.kill();
+                return Err("Hermes gateway exited before it became ready".to_string());
+            }
+            Ok(_) => {
+                if let Some(value) = line.split("HERMES_BACKEND_READY port=").nth(1) {
+                    break value
+                        .split_whitespace()
+                        .next()
+                        .ok_or_else(|| "Hermes gateway returned an invalid port".to_string())?
+                        .parse::<u16>()
+                        .map_err(|error| {
+                            format!("Hermes gateway returned an invalid port: {error}")
+                        })?;
+                }
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("Could not read Hermes gateway startup: {error}"));
+            }
+        }
+    };
+    thread::spawn(move || {
+        for line in reader.lines() {
+            if line.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(HermesBackendProcess {
+        child,
+        connection: HermesGatewayConnection {
+            ws_url: format!("ws://127.0.0.1:{port}/api/ws?token={token}"),
+        },
+    })
 }
 
-fn set_reasoning_effort(binary: &PathBuf, effort: &str) -> Result<(), String> {
-    const VALID_EFFORTS: &[&str] = &[
-        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-    ];
-    if !VALID_EFFORTS.contains(&effort) {
-        return Err("Invalid thinking effort".to_string());
+fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConnection, String> {
+    let mut slot = state
+        .0
+        .lock()
+        .map_err(|_| "Hermes gateway state is unavailable")?;
+    if let Some(backend) = slot.as_mut() {
+        if backend
+            .child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Ok(backend.connection.clone());
+        }
     }
-    let mut command = Command::new(binary);
-    command
-        .arg("config")
-        .arg("set")
-        .arg("agent.reasoning_effort")
-        .arg(effort);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+    let backend = start_hermes_backend()?;
+    let connection = backend.connection.clone();
+    *slot = Some(backend);
+    Ok(connection)
+}
+
+async fn gateway_rpc<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|error| format!("Could not send {method} to Hermes: {error}"))?;
+    while let Some(frame) = socket.next().await {
+        let frame = frame.map_err(|error| format!("Hermes gateway disconnected: {error}"))?;
+        let Message::Text(text) = frame else { continue };
+        let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Hermes request failed")
+                .to_string());
+        }
+        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("Could not set Hermes thinking effort: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    Err("Hermes gateway disconnected".to_string())
 }
 
 #[tauri::command]
-async fn ask_hermes(
+async fn ask_hermes_gateway(
+    app: AppHandle,
+    state: tauri::State<'_, HermesBackend>,
+    exchange_id: String,
     prompt: String,
-    session_id: Option<String>,
     image_data_urls: Vec<String>,
+    stored_session_id: Option<String>,
+    runtime_session_id: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
-) -> Result<AskResponse, String> {
-    let prompt = prompt.trim().to_string();
-    if prompt.is_empty() && image_data_urls.is_empty() {
-        return Err("Type a question or attach a screen region".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let binary = hermes_binary()?;
-        let attachments = image_data_urls
-            .iter()
-            .map(|data_url| write_attachment(data_url))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut full_prompt = if prompt.is_empty() {
-            "What can you tell me about this screenshot?".to_string()
+) -> Result<HermesTurnResponse, String> {
+    let connection = hermes_gateway_connection(&state)?;
+    let (mut socket, _) = connect_async(&connection.ws_url)
+        .await
+        .map_err(|error| format!("Could not connect to Hermes backend: {error}"))?;
+    let mut request_id = 0_u64;
+    let mut runtime_id = runtime_session_id.filter(|id| !id.trim().is_empty());
+    let mut stored_id = stored_session_id.filter(|id| !id.trim().is_empty());
+
+    if runtime_id.is_none() {
+        request_id += 1;
+        let result = if let Some(id) = stored_id.as_ref() {
+            gateway_rpc(
+                &mut socket,
+                request_id,
+                "session.resume",
+                json!({ "session_id": id, "source": "desktop" }),
+            )
+            .await?
         } else {
-            prompt
+            gateway_rpc(
+                &mut socket,
+                request_id,
+                "session.create",
+                json!({
+                    "source": "desktop",
+                    "model": model.unwrap_or_default(),
+                    "reasoning_effort": reasoning_effort.unwrap_or_default(),
+                }),
+            )
+            .await?
         };
-        for (index, path) in attachments.iter().enumerate() {
-            full_prompt.push_str(&format!(
-                "\n\nScreenshot {} is attached at this local path: {}. Inspect it as part of the question.",
-                index + 1,
-                path.display()
-            ));
-        }
-        let mut command = Command::new(&binary);
-        if session_id.is_none() {
-            if let Some(model) = model.as_ref().filter(|model| !model.trim().is_empty()) {
-                command.arg("--model").arg(model.trim());
+        runtime_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        stored_id = result
+            .get("stored_session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or(stored_id);
+    }
+
+    let runtime_id =
+        runtime_id.ok_or_else(|| "Hermes did not return a runtime session ID".to_string())?;
+    let stored_id =
+        stored_id.ok_or_else(|| "Hermes did not return a stored session ID".to_string())?;
+    app.emit(
+        "hermes-session-started",
+        HermesSessionStarted {
+            exchange_id: exchange_id.clone(),
+            runtime_session_id: runtime_id.clone(),
+            stored_session_id: stored_id.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    for (index, data_url) in image_data_urls.iter().enumerate() {
+        request_id += 1;
+        gateway_rpc(
+            &mut socket,
+            request_id,
+            "image.attach_bytes",
+            json!({
+                "session_id": runtime_id,
+                "content_base64": data_url,
+                "filename": format!("ask-hermes-{}.png", index + 1),
+            }),
+        )
+        .await?;
+    }
+
+    request_id += 1;
+    socket
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "prompt.submit",
+                "params": { "session_id": runtime_id, "text": prompt },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| format!("Could not submit the prompt to Hermes: {error}"))?;
+
+    while let Some(frame) = socket.next().await {
+        let frame = frame.map_err(|error| format!("Hermes gateway disconnected: {error}"))?;
+        let Message::Text(text) = frame else { continue };
+        let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if value.get("id").and_then(Value::as_u64) == Some(request_id) {
+            if let Some(error) = value.get("error") {
+                return Err(error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Hermes rejected the prompt")
+                    .to_string());
             }
+            continue;
         }
-        if let Some(id) = session_id.as_ref().filter(|id| !id.trim().is_empty()) {
-            command.arg("--resume").arg(id.trim());
+        let Some(params) = value.get("params") else {
+            continue;
+        };
+        if params.get("session_id").and_then(Value::as_str) != Some(runtime_id.as_str()) {
+            continue;
         }
-        command.arg("--oneshot").arg(&full_prompt);
-        if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
-            command.current_dir(home);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        let mut previous_effort = None;
-        if session_id.is_none() {
-            if let Some(effort) = reasoning_effort
-                .as_deref()
-                .map(str::trim)
-                .filter(|effort| !effort.is_empty())
-            {
-                let previous = read_reasoning_effort(&binary)?;
-                if previous != effort {
-                    set_reasoning_effort(&binary, effort)?;
-                    previous_effort = Some(previous);
-                }
-            }
-        }
-        let output = command.output().map_err(|error| format!("Could not start Hermes: {error}"));
-        if let Some(previous) = previous_effort {
-            let _ = set_reasoning_effort(&binary, &previous);
-        }
-        for path in attachments {
-            let _ = fs::remove_file(path);
-        }
-        let output = output?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(if stderr.is_empty() {
-                format!("Hermes exited with {}", output.status)
-            } else {
-                stderr
-            });
-        }
-        let answer = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let resolved_id = session_id
-            .filter(|id| !id.trim().is_empty())
-            .or_else(|| query_sessions(1).ok()?.into_iter().next().map(|session| session.id))
+        let event_type = params
+            .get("type")
+            .and_then(Value::as_str)
             .unwrap_or_default();
-        Ok(AskResponse { answer, session_id: resolved_id })
-    })
-    .await
-    .map_err(|error| format!("Hermes task failed: {error}"))?
+        let payload = params.get("payload").unwrap_or(&Value::Null);
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "message.delta" if !text.is_empty() => {
+                app.emit(
+                    "hermes-answer-delta",
+                    HermesAnswerDelta {
+                        exchange_id: exchange_id.clone(),
+                        text: text.to_string(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            "message.complete" => {
+                if payload.get("status").and_then(Value::as_str) == Some("error") {
+                    return Err(text.to_string());
+                }
+                return Ok(HermesTurnResponse {
+                    answer: text.to_string(),
+                    runtime_session_id: runtime_id,
+                    stored_session_id: stored_id,
+                });
+            }
+            "error" => return Err(text.to_string()),
+            _ => {}
+        }
+    }
+    Err("Hermes gateway disconnected before answering".to_string())
+}
+
+#[tauri::command]
+fn set_previous_chat_available(
+    available: bool,
+    state: tauri::State<'_, PreviousChatMenu>,
+) -> Result<(), String> {
+    let slot = state
+        .0
+        .lock()
+        .map_err(|_| "Tray menu state is unavailable")?;
+    if let Some(item) = slot.as_ref() {
+        item.set_enabled(available)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn image_data_url(image: &RgbaImage) -> Result<String, String> {
@@ -693,6 +881,8 @@ fn tray_icon() -> Image<'static> {
 pub fn run() {
     tauri::Builder::default()
         .manage(PendingCapture::default())
+        .manage(HermesBackend::default())
+        .manage(PreviousChatMenu::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -725,15 +915,27 @@ pub fn run() {
             app.global_shortcut().register(shortcut)?;
 
             let show = MenuItem::with_id(app, "show", "Open Ask Hermes", true, None::<&str>)?;
+            let previous =
+                MenuItem::with_id(app, "previous", "Open previous chat", false, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &settings, &quit])?;
+            *app.state::<PreviousChatMenu>()
+                .0
+                .lock()
+                .expect("tray menu state") = Some(previous.clone());
+            let menu = Menu::with_items(app, &[&show, &previous, &settings, &quit])?;
             TrayIconBuilder::new()
                 .icon(tray_icon())
                 .tooltip("Ask Hermes — Alt+Space")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_prompt(app),
+                    "previous" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = show_main_above_capture(&window);
+                            let _ = window.emit("open-previous-chat", ());
+                        }
+                    }
                     "settings" => show_settings(app),
                     "quit" => app.exit(0),
                     _ => {}
@@ -743,7 +945,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
-            ask_hermes,
+            ask_hermes_gateway,
+            set_previous_chat_available,
             start_selection,
             show_prepared_selection,
             capture_region,
