@@ -30,3 +30,7 @@ npm run tauri dev
 ```
 
 Build the NSIS installer with `npm run tauri build`.
+
+## License
+
+[MIT](LICENSE)
