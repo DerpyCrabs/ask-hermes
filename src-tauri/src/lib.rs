@@ -8,6 +8,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     env,
     io::{BufRead, BufReader, Cursor},
     path::PathBuf,
@@ -18,7 +19,7 @@ use std::{
 };
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, Submenu},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
@@ -82,6 +83,44 @@ impl Drop for HermesBackend {
 
 #[derive(Default)]
 struct PreviousChatMenu(Mutex<Option<MenuItem<tauri::Wry>>>);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionShortcutConfig {
+    shortcut: String,
+    session_id: String,
+}
+
+#[derive(Default)]
+struct SessionShortcutState(Mutex<Vec<SessionShortcutConfig>>);
+
+#[derive(Default)]
+struct SettingsWindowState(Mutex<bool>);
+
+#[derive(Default)]
+struct SessionShortcutTrayState(Mutex<SessionShortcutTray>);
+
+#[derive(Default)]
+struct SessionShortcutTray {
+    menu: Option<Menu<tauri::Wry>>,
+    submenu: Option<Submenu<tauri::Wry>>,
+    items: Vec<MenuItem<tauri::Wry>>,
+    session_by_item: HashMap<String, String>,
+    attached: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesHistoryMessage {
+    id: i64,
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesHistoryPage {
+    messages: Vec<HermesHistoryMessage>,
+    has_older: bool,
+}
 
 #[derive(Debug, Serialize)]
 struct CaptureResponse {
@@ -177,6 +216,11 @@ fn desktop_binary() -> Result<PathBuf, String> {
     Err("Hermes Desktop executable was not found".to_string())
 }
 
+#[tauri::command]
+fn hermes_desktop_available() -> bool {
+    desktop_binary().is_ok()
+}
+
 fn query_sessions(limit: usize) -> Result<Vec<HermesSession>, String> {
     let path = state_db_path()?;
     if !path.is_file() {
@@ -225,7 +269,84 @@ fn query_sessions_from(
 
 #[tauri::command]
 fn list_sessions() -> Result<Vec<HermesSession>, String> {
-    query_sessions(30)
+    query_sessions(200)
+}
+
+fn query_history_page_from(
+    connection: &Connection,
+    session_id: &str,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<HermesHistoryPage, String> {
+    let boundary = before_id.unwrap_or(i64::MAX);
+    let mut user_statement = connection
+        .prepare(
+            "SELECT id FROM messages
+             WHERE session_id = ?1 AND active = 1 AND role = 'user'
+               AND COALESCE(content, '') <> '' AND id < ?2
+             ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(|error| error.to_string())?;
+    let user_ids = user_statement
+        .query_map((session_id, boundary, limit.clamp(1, 50) as i64), |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let Some(earliest_id) = user_ids.last().copied() else {
+        return Ok(HermesHistoryPage {
+            messages: Vec::new(),
+            has_older: false,
+        });
+    };
+
+    let mut message_statement = connection
+        .prepare(
+            "SELECT id, role, content FROM messages
+             WHERE session_id = ?1 AND active = 1
+               AND role IN ('user', 'assistant')
+               AND COALESCE(content, '') <> ''
+               AND id >= ?2 AND id < ?3
+             ORDER BY id",
+        )
+        .map_err(|error| error.to_string())?;
+    let messages = message_statement
+        .query_map((session_id, earliest_id, boundary), |row| {
+            Ok(HermesHistoryMessage {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let has_older = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages
+             WHERE session_id = ?1 AND active = 1 AND role = 'user'
+               AND COALESCE(content, '') <> '' AND id < ?2)",
+            (session_id, earliest_id),
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(HermesHistoryPage {
+        messages,
+        has_older,
+    })
+}
+
+#[tauri::command]
+fn get_session_history_page(
+    session_id: String,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<HermesHistoryPage, String> {
+    let path = state_db_path()?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("Could not read Hermes history: {error}"))?;
+    query_history_page_from(&connection, &session_id, before_id, limit)
 }
 
 fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
@@ -525,6 +646,136 @@ fn set_previous_chat_available(
     Ok(())
 }
 
+fn register_session_shortcut(
+    app: &AppHandle,
+    binding: &SessionShortcutConfig,
+) -> Result<(), String> {
+    let shortcut = binding
+        .shortcut
+        .parse::<Shortcut>()
+        .map_err(|error| format!("Invalid shortcut {}: {error}", binding.shortcut))?;
+    let session_id = binding.session_id.clone();
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |app, _, event| {
+            if event.state() != ShortcutState::Pressed {
+                return;
+            }
+            show_session_shortcut(app, &session_id);
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn show_session_shortcut(app: &AppHandle, session_id: &str) {
+    if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
+        *open = false;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_size(Size::Logical(tauri::LogicalSize::new(620.0, 360.0)));
+        let _ = show_main_above_capture(&window);
+        let _ = window.emit("open-session-shortcut", session_id);
+    }
+}
+
+#[tauri::command]
+fn set_session_shortcuts(
+    app: AppHandle,
+    shortcuts: Vec<SessionShortcutConfig>,
+    state: tauri::State<'_, SessionShortcutState>,
+) -> Result<(), String> {
+    let base_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+    let mut ids = HashSet::new();
+    for binding in &shortcuts {
+        if binding.shortcut.trim().is_empty() || binding.session_id.trim().is_empty() {
+            return Err(
+                "Every session shortcut needs both a key combination and a session".to_string(),
+            );
+        }
+        let parsed = binding
+            .shortcut
+            .parse::<Shortcut>()
+            .map_err(|error| format!("Invalid shortcut {}: {error}", binding.shortcut))?;
+        if parsed.id() == base_shortcut.id() {
+            return Err("Alt+Space is reserved for the main Ask Hermes prompt".to_string());
+        }
+        if !ids.insert(parsed.id()) {
+            return Err(format!(
+                "Shortcut {} is assigned more than once",
+                binding.shortcut
+            ));
+        }
+    }
+
+    let mut active = state
+        .0
+        .lock()
+        .map_err(|_| "Session shortcut state is unavailable")?;
+    for binding in active.iter() {
+        let _ = app.global_shortcut().unregister(binding.shortcut.as_str());
+    }
+    let mut registered: Vec<String> = Vec::new();
+    for binding in &shortcuts {
+        if let Err(error) = register_session_shortcut(&app, binding) {
+            for item in &registered {
+                let _ = app.global_shortcut().unregister(item.as_str());
+            }
+            for previous in active.iter() {
+                let _ = register_session_shortcut(&app, previous);
+            }
+            return Err(error);
+        }
+        registered.push(binding.shortcut.clone());
+    }
+    *active = shortcuts.clone();
+    drop(active);
+
+    let titles = query_sessions(1000)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|session| (session.id, session.title))
+        .collect::<HashMap<_, _>>();
+    let tray_state = app.state::<SessionShortcutTrayState>();
+    let mut tray = tray_state
+        .0
+        .lock()
+        .map_err(|_| "Session tray state is unavailable")?;
+    if let Some(submenu) = tray.submenu.clone() {
+        for item in tray.items.drain(..) {
+            submenu.remove(&item).map_err(|error| error.to_string())?;
+        }
+        tray.session_by_item.clear();
+        for (index, binding) in shortcuts.iter().enumerate() {
+            let item_id = format!("session-shortcut-{index}");
+            let title = titles
+                .get(&binding.session_id)
+                .cloned()
+                .unwrap_or_else(|| "Untitled session".to_string());
+            let item = MenuItem::with_id(
+                &app,
+                &item_id,
+                format!("{title}    {}", binding.shortcut),
+                true,
+                None::<&str>,
+            )
+            .map_err(|error| error.to_string())?;
+            submenu.append(&item).map_err(|error| error.to_string())?;
+            tray.session_by_item
+                .insert(item_id, binding.session_id.clone());
+            tray.items.push(item);
+        }
+        if let Some(menu) = tray.menu.clone() {
+            if shortcuts.is_empty() && tray.attached {
+                menu.remove(&submenu).map_err(|error| error.to_string())?;
+                tray.attached = false;
+            } else if !shortcuts.is_empty() && !tray.attached {
+                menu.insert(&submenu, 2)
+                    .map_err(|error| error.to_string())?;
+                tray.attached = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn image_data_url(image: &RgbaImage) -> Result<String, String> {
     let mut bytes = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image.clone())
@@ -806,6 +1057,10 @@ fn set_prompt_expanded(window: WebviewWindow, expanded: bool) -> Result<(), Stri
 
 #[tauri::command]
 fn hide_window(app: AppHandle) -> Result<(), String> {
+    *app.state::<SettingsWindowState>()
+        .0
+        .lock()
+        .map_err(|_| "Settings state is unavailable")? = false;
     if let Some(capture) = app.get_webview_window("capture") {
         capture.hide().map_err(|error| error.to_string())?;
     }
@@ -818,6 +1073,9 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 }
 
 fn show_settings(app: &AppHandle) {
+    if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
+        *open = true;
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = show_main_above_capture(&window);
         let _ = window.emit("open-settings", ());
@@ -842,6 +1100,20 @@ fn open_hermes_desktop() -> Result<(), String> {
 fn show_prompt(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let visible = window.is_visible().unwrap_or(false);
+        let settings_open = app
+            .state::<SettingsWindowState>()
+            .0
+            .lock()
+            .map(|open| *open)
+            .unwrap_or(false);
+        if settings_open {
+            if !visible {
+                let _ = show_main_above_capture(&window);
+            } else {
+                let _ = window.set_focus();
+            }
+            return;
+        }
         if visible && window.is_focused().unwrap_or(false) {
             let _ = hide_window(app.clone());
         } else if visible {
@@ -883,10 +1155,18 @@ pub fn run() {
         .manage(PendingCapture::default())
         .manage(HermesBackend::default())
         .manage(PreviousChatMenu::default())
+        .manage(SessionShortcutState::default())
+        .manage(SessionShortcutTrayState::default())
+        .manage(SettingsWindowState::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if window.label() == "main" {
+                    if let Ok(mut open) =
+                        window.app_handle().state::<SettingsWindowState>().0.lock()
+                    {
+                        *open = false;
+                    }
                     let _ = window.emit("clear-prompt", ());
                 }
                 let _ = window.hide();
@@ -919,32 +1199,77 @@ pub fn run() {
                 MenuItem::with_id(app, "previous", "Open previous chat", false, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let open_desktop = if desktop_binary().is_ok() {
+                Some(MenuItem::with_id(
+                    app,
+                    "open-desktop",
+                    "Open Hermes Desktop",
+                    true,
+                    None::<&str>,
+                )?)
+            } else {
+                None
+            };
+            let session_shortcuts = Submenu::new(app, "Sessions", true)?;
             *app.state::<PreviousChatMenu>()
                 .0
                 .lock()
                 .expect("tray menu state") = Some(previous.clone());
-            let menu = Menu::with_items(app, &[&show, &previous, &settings, &quit])?;
+            let menu = if let Some(open_desktop) = open_desktop.as_ref() {
+                Menu::with_items(app, &[&show, &previous, open_desktop, &settings, &quit])?
+            } else {
+                Menu::with_items(app, &[&show, &previous, &settings, &quit])?
+            };
+            {
+                let tray_state = app.state::<SessionShortcutTrayState>();
+                let mut tray = tray_state.0.lock().expect("session tray state");
+                tray.menu = Some(menu.clone());
+                tray.submenu = Some(session_shortcuts.clone());
+            }
             TrayIconBuilder::new()
                 .icon(tray_icon())
                 .tooltip("Ask Hermes — Alt+Space")
                 .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_prompt(app),
-                    "previous" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = show_main_above_capture(&window);
-                            let _ = window.emit("open-previous-chat", ());
+                .on_menu_event(|app, event| {
+                    let item_id = event.id().as_ref();
+                    match item_id {
+                        "show" => show_prompt(app),
+                        "previous" => {
+                            if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
+                                *open = false;
+                            }
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = show_main_above_capture(&window);
+                                let _ = window.emit("open-previous-chat", ());
+                            }
                         }
+                        "settings" => show_settings(app),
+                        "open-desktop" => {
+                            let _ = open_hermes_desktop();
+                        }
+                        "quit" => app.exit(0),
+                        _ if item_id.starts_with("session-shortcut-") => {
+                            let session_id = app
+                                .state::<SessionShortcutTrayState>()
+                                .0
+                                .lock()
+                                .ok()
+                                .and_then(|tray| tray.session_by_item.get(item_id).cloned());
+                            if let Some(session_id) = session_id {
+                                show_session_shortcut(app, &session_id);
+                            }
+                        }
+                        _ => {}
                     }
-                    "settings" => show_settings(app),
-                    "quit" => app.exit(0),
-                    _ => {}
                 })
                 .build(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            hermes_desktop_available,
+            get_session_history_page,
+            set_session_shortcuts,
             ask_hermes_gateway,
             set_previous_chat_available,
             start_selection,
@@ -1016,5 +1341,47 @@ mod tests {
         let sessions = query_sessions_from(&db, 20).unwrap();
         assert_eq!(sessions[0].title, "Untitled session");
         assert_eq!(sessions[1].title, "Display name");
+    }
+
+    #[test]
+    fn pages_history_by_complete_user_turns() {
+        let db = session_db();
+        db.execute(
+            "INSERT INTO sessions VALUES ('chat', 'desktop', NULL, 10, 'Chat', 0)",
+            [],
+        )
+        .unwrap();
+        for turn in 0..6_i64 {
+            db.execute(
+                "INSERT INTO messages (id, session_id, role, content, timestamp, active)
+                 VALUES (?1, 'chat', 'user', ?2, ?1, 1)",
+                (turn * 2 + 1, format!("question {turn}")),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO messages (id, session_id, role, content, timestamp, active)
+                 VALUES (?1, 'chat', 'assistant', ?2, ?1, 1)",
+                (turn * 2 + 2, format!("answer {turn}")),
+            )
+            .unwrap();
+        }
+
+        let latest = query_history_page_from(&db, "chat", None, 5).unwrap();
+        assert!(latest.has_older);
+        assert_eq!(latest.messages.first().unwrap().content, "question 1");
+        assert_eq!(latest.messages.last().unwrap().content, "answer 5");
+
+        let older =
+            query_history_page_from(&db, "chat", Some(latest.messages.first().unwrap().id), 5)
+                .unwrap();
+        assert!(!older.has_older);
+        assert_eq!(older.messages.len(), 2);
+        assert_eq!(older.messages[0].content, "question 0");
+    }
+
+    #[test]
+    fn accepts_shortcut_strings_recorded_by_the_settings_ui() {
+        assert!("Ctrl+Alt+H".parse::<Shortcut>().is_ok());
+        assert!("Shift+F8".parse::<Shortcut>().is_ok());
     }
 }

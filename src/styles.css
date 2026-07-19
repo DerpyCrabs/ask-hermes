@@ -106,6 +106,10 @@ button { color: inherit; }
   cursor: grab;
 }
 .conversation-bar button { border: 0; background: transparent; color: #0053fd; font-size: 11px; cursor: pointer; }
+.history-loading { height: 28px; display: flex; align-items: center; justify-content: center; gap: 7px; color: #7b8190; font-size: 10px; }
+.history-loading .capture-spinner { width: 12px; height: 12px; }
+.history-opening { height: calc(100% - 44px); display: flex; align-items: center; justify-content: center; gap: 8px; color: #7b8190; font-size: 11px; }
+.history-opening .capture-spinner { width: 14px; height: 14px; }
 .exchange { display: flex; flex-direction: column; gap: 11px; margin-bottom: 16px; }
 .question { align-self: flex-end; max-width: 84%; padding: 8px 11px; border: 1px solid rgba(0,83,253,.16); border-radius: 12px 12px 4px 12px; background: rgba(0,83,253,.06); font-size: 12px; white-space: pre-wrap; }
 .question-captures { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
@@ -141,15 +145,36 @@ button { color: inherit; }
 .capture-preview { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 28px; background: rgba(238,243,255,.94); }
 .capture-preview img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 10px; box-shadow: 0 12px 34px rgba(25,47,92,.2); }
 .capture-preview > button { position: absolute; right: 16px; top: 14px; width: 30px; height: 30px; border: 0; border-radius: 50%; background: rgba(23,23,26,.08); color: #44444d; font-size: 22px; line-height: 28px; cursor: pointer; }
-.settings-panel { position: fixed; z-index: 21; inset: 0; padding: 17px 26px; background: rgba(248,250,255,.99); }
-.settings-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; color: #17171a; font-size: 16px; font-weight: 650; }
-.settings-header button { width: 28px; height: 28px; border: 0; border-radius: 50%; background: rgba(23,23,26,.06); font-size: 20px; cursor: pointer; }
-.settings-panel label { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 16px; margin: 12px 0; color: #666678; font-size: 12px; }
+.settings-panel { position: fixed; z-index: 21; inset: 0; padding: 16px 26px 18px; display: flex; flex-direction: column; overflow: hidden; background: rgba(248,250,255,.99); }
+.settings-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; color: #17171a; font-size: 16px; font-weight: 650; }
+.settings-header button { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(23,23,26,.06); cursor: pointer; }
+.settings-header button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.settings-tabs { flex: 0 0 auto; display: flex; gap: 4px; margin: 12px 0 4px; padding: 3px; border-radius: 10px; background: rgba(0,83,253,.045); }
+.settings-tabs button { flex: 1; height: 32px; border: 0; border-radius: 8px; background: transparent; color: #747988; font-size: 11px; cursor: pointer; }
+.settings-tabs button.active { background: #fff; color: #0053fd; box-shadow: 0 1px 4px rgba(31,51,91,.09); }
+.settings-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 4px 8px 0; }
+.settings-body::-webkit-scrollbar { width: 5px; }
+.settings-body::-webkit-scrollbar-thumb { border-radius: 5px; background: rgba(0,83,253,.16); }
+.settings-form { padding: 2px 4px; }
+.settings-panel label { display: grid; grid-template-columns: 155px 1fr; align-items: center; gap: 20px; margin: 14px 0; color: #666678; font-size: 12px; }
 .settings-panel select { height: 38px; padding: 0 10px; border: 1px solid rgba(0,83,253,.18); border-radius: 9px; outline: 0; background: #fff; color: #17171a; }
 .settings-toggle { min-height: 24px; margin-top: 6px !important; margin-bottom: 6px !important; }
 .settings-toggle input { width: 18px; height: 18px; margin: 0; accent-color: #0053fd; cursor: pointer; }
-.settings-panel p { margin: 16px 0; color: #7b8190; font-size: 11px; }
-.settings-save { float: right; height: 36px; padding: 0 18px; border: 0; border-radius: 10px; background: #0053fd; color: white; cursor: pointer; }
+.settings-panel p { margin: 18px 0 4px; color: #7b8190; font-size: 11px; }
+.settings-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; padding-top: 10px; border-top: 1px solid rgba(0,83,253,.08); }
+.settings-save { height: 34px; padding: 0 18px; border: 0; border-radius: 9px; background: #0053fd; color: white; cursor: pointer; }
+.shortcut-settings { padding: 6px 4px; }
+.shortcut-settings-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.shortcut-settings-header h3 { margin: 0 0 2px; color: #292930; font-size: 12px; font-weight: 650; }
+.shortcut-settings-header span { display: block; color: #8a8f9d; font-size: 10px; }
+.shortcut-settings-header button { height: 30px; padding: 0 11px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: rgba(0,83,253,.06); color: #0053fd; font-size: 11px; cursor: pointer; }
+.shortcut-settings-header button:disabled { opacity: .4; cursor: default; }
+.shortcut-empty { margin-top: 18px; padding: 30px 16px; border: 1px dashed rgba(0,83,253,.18); border-radius: 12px; color: #8a8f9d; text-align: center; font-size: 11px; }
+.shortcut-row { display: grid; grid-template-columns: 128px minmax(0,1fr) 28px; align-items: center; gap: 9px; margin-top: 10px; }
+.shortcut-row input, .shortcut-row select { width: 100%; height: 34px; padding: 0 9px; border: 1px solid rgba(0,83,253,.16); border-radius: 8px; outline: 0; background: #fff; color: #363640; font-size: 11px; }
+.shortcut-row input { text-align: center; cursor: pointer; }
+.shortcut-row input:focus { border-color: rgba(0,83,253,.55); box-shadow: 0 0 0 2px rgba(0,83,253,.07); }
+.shortcut-remove { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(23,23,26,.055); color: #777783; font-size: 17px; line-height: 1; cursor: pointer; }
 
 .capture-document, .capture-document body, .capture-document #root { background: transparent !important; }
 .capture-surface { position: fixed; inset: 0; overflow: hidden; cursor: crosshair; user-select: none; background: transparent; }

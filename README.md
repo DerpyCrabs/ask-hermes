@@ -12,6 +12,7 @@ Press **Alt+Space**, type a question, paste an image, or capture one or more scr
 
 - Global **Alt+Space** prompt and persistent tray process
 - Restore the previous in-window chat from the tray
+- Assign global hotkeys and tray entries to specific Hermes sessions
 - New or existing Hermes sessions
 - Multiple screen captures and clipboard images
 - Configurable model, thinking effort, and Windows startup
