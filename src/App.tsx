@@ -4,6 +4,11 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart'
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import type { JSX } from 'solid-js'
+import ArrowRight from 'lucide-solid/icons/arrow-right'
+import Camera from 'lucide-solid/icons/camera'
+import ChevronDown from 'lucide-solid/icons/chevron-down'
+import ExternalLink from 'lucide-solid/icons/external-link'
+import X from 'lucide-solid/icons/x'
 import { NEW_SESSION, normalizeSelection } from './selection'
 import { appendCapture, clipboardImageFiles, imageFileToCapture, removeCaptureAt, type Capture } from './captures'
 import { renderMarkdown } from './markdown'
@@ -424,7 +429,7 @@ function PromptWindow() {
             }}>
               <div class="conversation-bar drag-zone" data-tauri-drag-region>
                 <span>Ask Hermes</span>
-                <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes ↗</button></Show>
+                <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes <ExternalLink size={12} /></button></Show>
               </div>
               <Show when={loadingSessionHistory()}><div class="history-opening"><span class="capture-spinner" /> Opening session…</div></Show>
               <Show when={loadingOlderMessages()}><div class="history-loading"><span class="capture-spinner" /> Loading earlier messages…</div></Show>
@@ -462,7 +467,7 @@ function PromptWindow() {
                   <button class="attachment-preview" aria-label={`Preview capture ${index() + 1}`} onClick={() => setPreview(capture)}>
                     <img src={capture.data_url} alt={`Screen capture ${index() + 1}`} />
                   </button>
-                  <button class="attachment-remove" aria-label={`Remove capture ${index() + 1}`} onClick={() => setCaptures(items => removeCaptureAt(items, index()))}>×</button>
+                  <button class="attachment-remove" aria-label={`Remove capture ${index() + 1}`} onClick={() => setCaptures(items => removeCaptureAt(items, index()))}><X size={11} /></button>
                 </div>
                 )}</For>
               </div>
@@ -479,12 +484,12 @@ function PromptWindow() {
             />
             <button class="capture-button" classList={{ capturing: capturing() }} onClick={beginCapture} disabled={busy() || capturing()} title="Select another screen region" aria-label={capturing() ? 'Preparing screen capture' : 'Select screen region'}>
               <Show when={!capturing()} fallback={<span class="capture-spinner" />}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5.5" width="17" height="13" rx="2.5" /><circle cx="12" cy="12" r="3.25" /><path d="M8 5.5 9.2 3.8h5.6L16 5.5" /></svg>
+              <Camera size={20} />
               </Show>
             </button>
             <button class="send-button" aria-label="Ask Hermes" onClick={submit} disabled={busy() || capturing() || (!prompt().trim() && captures().length === 0)}>
               <Show when={!busy()} fallback={<span class="spinner" />}>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12M13 7l5 5-5 5" /></svg>
+                <ArrowRight size={20} />
               </Show>
             </button>
           </div>
@@ -495,12 +500,12 @@ function PromptWindow() {
               if (event.target === event.currentTarget) setPreview(undefined)
             }}>
               <img src={capture().data_url} alt="Screen capture preview" />
-              <button aria-label="Close capture preview" onClick={() => setPreview(undefined)}>×</button>
+              <button aria-label="Close capture preview" onClick={() => setPreview(undefined)}><X size={18} /></button>
             </div>
           )}</Show>
           <Show when={settingsOpen()}>
             <div class="settings-panel" role="dialog" aria-modal="true" aria-label="Ask Hermes settings">
-              <div class="settings-header"><span>Settings</span><button aria-label="Close settings" onClick={() => void invoke('hide_window')}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8m0-8-8 8" /></svg></button></div>
+              <div class="settings-header"><span>Settings</span><button aria-label="Close settings" onClick={() => void invoke('hide_window')}><X size={16} /></button></div>
               <nav class="settings-tabs" aria-label="Settings sections">
                 <button classList={{ active: settingsTab() === 'general' }} onClick={() => setSettingsTab('general')}>General</button>
                 <button classList={{ active: settingsTab() === 'shortcuts' }} onClick={() => setSettingsTab('shortcuts')}>Session shortcuts</button>
@@ -510,33 +515,42 @@ function PromptWindow() {
                   <div class="settings-form">
                     <label>
                       Session
-                      <select data-session-preference value={sessionPreference()} onChange={event => setSessionPreference(event.currentTarget.value)}>
-                        <option value={NEW_SESSION}>Always start a new session</option>
-                        <For each={sessions()}>
-                          {session => <option value={session.id}>{session.title} · {compactTime(session.last_active)}</option>}
-                        </For>
-                      </select>
+                      <span class="select-shell">
+                        <select data-session-preference value={sessionPreference()} onChange={event => setSessionPreference(event.currentTarget.value)}>
+                          <option value={NEW_SESSION}>Always start a new session</option>
+                          <For each={sessions()}>
+                            {session => <option value={session.id}>{session.title} · {compactTime(session.last_active)}</option>}
+                          </For>
+                        </select>
+                        <ChevronDown class="select-chevron" size={16} />
+                      </span>
                     </label>
                     <label>
                       Model
-                      <select value={model()} onChange={event => setModel(event.currentTarget.value)}>
-                        <option value="">Hermes default</option>
-                        <option value="gpt-5.6-terra">GPT-5.6 Terra · faster</option>
-                        <option value="gpt-5.6-sol">GPT-5.6 Sol · strongest</option>
-                      </select>
+                      <span class="select-shell">
+                        <select value={model()} onChange={event => setModel(event.currentTarget.value)}>
+                          <option value="">Hermes default</option>
+                          <option value="gpt-5.6-terra">GPT-5.6 Terra · faster</option>
+                          <option value="gpt-5.6-sol">GPT-5.6 Sol · strongest</option>
+                        </select>
+                        <ChevronDown class="select-chevron" size={16} />
+                      </span>
                     </label>
                     <label>
                       Thinking effort
-                      <select value={effort()} onChange={event => setEffort(event.currentTarget.value)}>
-                        <option value="none">None</option>
-                        <option value="minimal">Minimal</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="xhigh">Extra high</option>
-                        <option value="max">Max</option>
-                        <option value="ultra">Ultra</option>
-                      </select>
+                      <span class="select-shell">
+                        <select value={effort()} onChange={event => setEffort(event.currentTarget.value)}>
+                          <option value="none">None</option>
+                          <option value="minimal">Minimal</option>
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                          <option value="xhigh">Extra high</option>
+                          <option value="max">Max</option>
+                          <option value="ultra">Ultra</option>
+                        </select>
+                        <ChevronDown class="select-chevron" size={16} />
+                      </span>
                     </label>
                     <label class="settings-toggle">
                       Start with Windows
@@ -555,10 +569,13 @@ function PromptWindow() {
                       <For each={sessionShortcuts()}>{binding => (
                         <div class="shortcut-row">
                           <input data-id={binding.id} value={binding.shortcut} readOnly placeholder="Press keys" aria-label="Shortcut keys" onKeyDown={recordShortcut} />
-                          <select data-session-shortcut={binding.id} value={binding.sessionId} aria-label="Hermes session" onChange={event => updateSessionShortcut(binding.id, { sessionId: event.currentTarget.value })}>
-                            <For each={sessions()}>{session => <option value={session.id}>{session.title} · {compactTime(session.last_active)}</option>}</For>
-                          </select>
-                          <button class="shortcut-remove" type="button" aria-label="Remove shortcut" onClick={() => setSessionShortcuts(items => items.filter(item => item.id !== binding.id))}>×</button>
+                          <span class="select-shell">
+                            <select data-session-shortcut={binding.id} value={binding.sessionId} aria-label="Hermes session" onChange={event => updateSessionShortcut(binding.id, { sessionId: event.currentTarget.value })}>
+                              <For each={sessions()}>{session => <option value={session.id}>{session.title} · {compactTime(session.last_active)}</option>}</For>
+                            </select>
+                            <ChevronDown class="select-chevron" size={15} />
+                          </span>
+                          <button class="shortcut-remove" type="button" aria-label="Remove shortcut" onClick={() => setSessionShortcuts(items => items.filter(item => item.id !== binding.id))}><X size={15} /></button>
                         </div>
                       )}</For>
                     </Show>
