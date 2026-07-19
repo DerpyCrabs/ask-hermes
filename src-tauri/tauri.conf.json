@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ask Hermes",
+  "version": "0.1.0",
+  "identifier": "app.hermes.ask",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Ask Hermes",
+        "width": 620,
+        "height": 76,
+        "center": true,
+        "decorations": false,
+        "transparent": false,
+        "alwaysOnTop": true,
+        "resizable": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "shadow": false
+      },
+      {
+        "label": "capture",
+        "title": "Ask Hermes Capture",
+        "width": 100,
+        "height": 100,
+        "x": 0,
+        "y": 0,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "visible": false,
+        "skipTaskbar": true,
+        "shadow": false
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "shortDescription": "Ask Hermes from anywhere",
+    "longDescription": "A fast global prompt window for Hermes Agent with screen-region capture."
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "ask-hermes"
+version = "0.1.0"
+description = "A global quick prompt for Hermes Agent"
+authors = ["Ask Hermes"]
+edition = "2021"
+
+[lib]
+name = "hermes_ask_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.150"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+xcap = "0.9.6"
+image = "0.25.10"
+base64 = "0.22.1"
+chrono = "0.4.45"
+
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-autostart = "2.5.1"
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
