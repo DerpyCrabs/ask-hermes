@@ -436,16 +436,24 @@ function PromptWindow() {
 
   const startDragging: JSX.EventHandler<HTMLElement, MouseEvent> = event => {
     const target = event.target as HTMLElement
-    if (!target.closest('button, input, textarea, select, .attachments, .capture-preview, .settings-panel')) {
+    if (!target.closest('a, button, input, textarea, select, .attachments, .capture-preview, .settings-panel')) {
       void getCurrentWindow().startDragging()
     }
+  }
+
+  const openAnswerLink: JSX.EventHandler<HTMLDivElement, MouseEvent> = event => {
+    const anchor = (event.target as Element).closest<HTMLAnchorElement>('.answer a')
+    if (!anchor) return
+    event.preventDefault()
+    event.stopPropagation()
+    void invoke('open_external_url', { url: anchor.href }).catch(reason => setError(String(reason)))
   }
 
   return (
       <main class="window-shell" classList={{ expanded: history().length > 0 || loadingSessionHistory() }} onMouseDown={startDragging} data-tauri-drag-region>
         <section class="content" data-tauri-drag-region>
           <Show when={history().length || loadingSessionHistory()}>
-            <div class="conversation" ref={conversationRef} onScroll={event => {
+            <div class="conversation" ref={conversationRef} onClick={openAnswerLink} onScroll={event => {
               if (event.currentTarget.scrollTop < 36) void loadOlderHistory()
             }}>
               <div class="conversation-bar drag-zone" data-tauri-drag-region>

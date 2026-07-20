@@ -1200,6 +1200,51 @@ fn open_hermes_desktop() -> Result<(), String> {
     Ok(())
 }
 
+fn allowed_external_url(url: &str) -> bool {
+    let normalized = url.trim();
+    normalized.len() <= 8192
+        && !normalized.chars().any(char::is_control)
+        && (normalized.starts_with("https://")
+            || normalized.starts_with("http://")
+            || normalized.starts_with("mailto:"))
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !allowed_external_url(url) {
+        return Err("Only http, https, and mailto links can be opened".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .creation_flags(0x08000000)
+            .spawn()
+            .map_err(|error| format!("Could not open the link: {error}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("Could not open the link: {error}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("Could not open the link: {error}"))?;
+        Ok(())
+    }
+}
+
 fn show_prompt(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let visible = window.is_visible().unwrap_or(false);
@@ -1391,7 +1436,8 @@ pub fn run() {
             cancel_selection,
             set_prompt_expanded,
             hide_window,
-            open_hermes_desktop
+            open_hermes_desktop,
+            open_external_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ask Hermes");
@@ -1496,5 +1542,15 @@ mod tests {
     fn accepts_shortcut_strings_recorded_by_the_settings_ui() {
         assert!("Ctrl+Alt+H".parse::<Shortcut>().is_ok());
         assert!("Shift+F8".parse::<Shortcut>().is_ok());
+    }
+
+    #[test]
+    fn only_allows_safe_external_link_schemes() {
+        assert!(allowed_external_url("https://example.com/path?q=1"));
+        assert!(allowed_external_url("http://localhost:3000"));
+        assert!(allowed_external_url("mailto:hello@example.com"));
+        assert!(!allowed_external_url("javascript:alert(1)"));
+        assert!(!allowed_external_url("file:///C:/Windows/System32"));
+        assert!(!allowed_external_url("https://example.com\nmalicious"));
     }
 }
