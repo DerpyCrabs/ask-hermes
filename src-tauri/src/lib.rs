@@ -485,6 +485,7 @@ async fn ask_hermes_gateway(
     runtime_session_id: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    fast: Option<bool>,
 ) -> Result<HermesTurnResponse, String> {
     let connection = hermes_gateway_connection(&state)?;
     let (mut socket, _) = connect_async(&connection.ws_url)
@@ -513,6 +514,7 @@ async fn ask_hermes_gateway(
                     "source": "desktop",
                     "model": model.unwrap_or_default(),
                     "reasoning_effort": reasoning_effort.unwrap_or_default(),
+                    "fast": fast.unwrap_or(false),
                 }),
             )
             .await?

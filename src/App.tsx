@@ -17,6 +17,7 @@ import { runHermesTurn } from './hermes-gateway'
 import { appendAnswerDelta, beginExchange, finishExchange, type Exchange } from './conversation'
 import { shortcutFromKeyboardEvent, transcriptFromMessages, type HistoryMessage, type HistoryPage, type SessionShortcut } from './session-shortcuts'
 import { sessionsEqual, type SessionRecord } from './sessions'
+import { supportsFastMode } from './model-settings'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -27,6 +28,7 @@ type PreviousChat = { history: Exchange[]; activeSession: string; runtimeSession
 const SESSION_PREFERENCE_KEY = 'ask-hermes.session-preference.v2'
 const MODEL_KEY = 'ask-hermes.model'
 const EFFORT_KEY = 'ask-hermes.reasoning-effort'
+const FAST_KEY = 'ask-hermes.fast-mode'
 const SESSION_SHORTCUTS_KEY = 'ask-hermes.session-shortcuts.v1'
 
 function storedSessionShortcuts(): SessionShortcut[] {
@@ -64,6 +66,7 @@ function PromptWindow() {
   const [settingsTab, setSettingsTab] = createSignal<'general' | 'shortcuts'>('general')
   const [model, setModel] = createSignal(localStorage.getItem(MODEL_KEY) || 'gpt-5.6-terra')
   const [effort, setEffort] = createSignal(localStorage.getItem(EFFORT_KEY) || 'low')
+  const [fastMode, setFastMode] = createSignal(localStorage.getItem(FAST_KEY) === 'true')
   const [startAtLogin, setStartAtLogin] = createSignal(false)
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(storedSessionShortcuts())
   const [pagedMessages, setPagedMessages] = createSignal<HistoryMessage[]>([])
@@ -260,6 +263,7 @@ function PromptWindow() {
         runtimeSessionId: runtimeSession(),
         model: selectedSession === NEW_SESSION ? model() || undefined : undefined,
         reasoningEffort: selectedSession === NEW_SESSION ? effort() || undefined : undefined,
+        fast: selectedSession === NEW_SESSION && supportsFastMode(model()) ? fastMode() : undefined,
         onSession: (runtimeId, storedId) => {
           if (generation !== promptGeneration) return
           setRuntimeSession(runtimeId)
@@ -333,6 +337,7 @@ function PromptWindow() {
       localStorage.setItem(SESSION_PREFERENCE_KEY, sessionPreference())
       localStorage.setItem(MODEL_KEY, model())
       localStorage.setItem(EFFORT_KEY, effort())
+      localStorage.setItem(FAST_KEY, String(fastMode()))
       await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
       localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(sessionShortcuts()))
       if (history().length === 0) {
@@ -429,7 +434,12 @@ function PromptWindow() {
             }}>
               <div class="conversation-bar drag-zone" data-tauri-drag-region>
                 <span>Ask Hermes</span>
-                <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes <ExternalLink size={12} /></button></Show>
+                <div class="conversation-actions">
+                  <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes <ExternalLink size={12} /></button></Show>
+                  <button class="conversation-close" aria-label="Close Ask Hermes" title="Close" onClick={() => void invoke('hide_window')}>
+                    <X size={14} />
+                  </button>
+                </div>
               </div>
               <Show when={loadingSessionHistory()}><div class="history-opening"><span class="capture-spinner" /> Opening session…</div></Show>
               <Show when={loadingOlderMessages()}><div class="history-loading"><span class="capture-spinner" /> Loading earlier messages…</div></Show>
@@ -552,11 +562,17 @@ function PromptWindow() {
                         <ChevronDown class="select-chevron" size={16} />
                       </span>
                     </label>
+                    <Show when={supportsFastMode(model())}>
+                      <label class="settings-toggle">
+                        Fast mode
+                        <input type="checkbox" checked={fastMode()} onChange={event => setFastMode(event.currentTarget.checked)} />
+                      </label>
+                    </Show>
                     <label class="settings-toggle">
                       Start with Windows
                       <input type="checkbox" checked={startAtLogin()} onChange={event => setStartAtLogin(event.currentTarget.checked)} />
                     </label>
-                    <p>Model and thinking effort apply only to sessions created by Ask Hermes.</p>
+                    <p>Model, thinking effort, and Fast mode apply only to sessions created by Ask Hermes.</p>
                   </div>
                 </Show>
                 <Show when={settingsTab() === 'shortcuts'}>

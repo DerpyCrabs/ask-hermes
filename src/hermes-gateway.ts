@@ -9,6 +9,7 @@ type TurnOptions = {
   runtimeSessionId?: string
   model?: string
   reasoningEffort?: string
+  fast?: boolean
   onDelta(text: string): void
   onSession(runtimeSessionId: string, storedSessionId: string): void
 }
@@ -41,6 +42,7 @@ export async function runHermesTurn(options: TurnOptions) {
       runtimeSessionId: options.runtimeSessionId,
       model: options.model,
       reasoningEffort: options.reasoningEffort,
+      fast: options.fast,
     })
     return {
       answer: result.answer,
