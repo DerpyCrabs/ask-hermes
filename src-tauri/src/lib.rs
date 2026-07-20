@@ -56,6 +56,14 @@ struct HermesAnswerDelta {
     text: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct HermesTurnActivity {
+    exchange_id: String,
+    kind: String,
+    tool_name: Option<String>,
+    context: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HermesTurnResponse {
     answer: String,
@@ -605,6 +613,37 @@ async fn ask_hermes_gateway(
             .and_then(Value::as_str)
             .unwrap_or_default();
         match event_type {
+            "tool.start" | "tool.started" => {
+                app.emit(
+                    "hermes-turn-activity",
+                    HermesTurnActivity {
+                        exchange_id: exchange_id.clone(),
+                        kind: "tool".to_string(),
+                        tool_name: payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        context: payload
+                            .get("context")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            "tool.complete" | "tool.completed" | "tool.failed" | "reasoning.available" => {
+                app.emit(
+                    "hermes-turn-activity",
+                    HermesTurnActivity {
+                        exchange_id: exchange_id.clone(),
+                        kind: "thinking".to_string(),
+                        tool_name: None,
+                        context: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            }
             "message.delta" if !text.is_empty() => {
                 app.emit(
                     "hermes-answer-delta",
@@ -1153,7 +1192,21 @@ fn tray_icon() -> Image<'static> {
 }
 
 pub fn run() {
+    let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+    let registered_shortcut = shortcut.clone();
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, pressed, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if pressed == &shortcut {
+                        show_prompt(app);
+                    }
+                })
+                .build(),
+        )
         .manage(PendingCapture::default())
         .manage(HermesBackend::default())
         .manage(PreviousChatMenu::default())
@@ -1174,27 +1227,14 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(windows)]
             app.handle().plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 None,
             ))?;
 
-            let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-            app.handle().plugin(
-                tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(move |app, pressed, event| {
-                        if event.state() != ShortcutState::Pressed {
-                            return;
-                        }
-                        if pressed == &shortcut {
-                            show_prompt(app);
-                        }
-                    })
-                    .build(),
-            )?;
-            app.global_shortcut().register(shortcut)?;
+            app.global_shortcut().register(registered_shortcut)?;
 
             let show = MenuItem::with_id(app, "show", "Open Ask Hermes", true, None::<&str>)?;
             let previous =

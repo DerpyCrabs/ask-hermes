@@ -8,6 +8,7 @@ import ArrowRight from 'lucide-solid/icons/arrow-right'
 import Camera from 'lucide-solid/icons/camera'
 import ChevronDown from 'lucide-solid/icons/chevron-down'
 import ExternalLink from 'lucide-solid/icons/external-link'
+import LoaderCircle from 'lucide-solid/icons/loader-circle'
 import X from 'lucide-solid/icons/x'
 import { NEW_SESSION, normalizeSelection } from './selection'
 import { appendCapture, clipboardImageFiles, imageFileToCapture, removeCaptureAt, type Capture } from './captures'
@@ -18,6 +19,7 @@ import { appendAnswerDelta, beginExchange, finishExchange, type Exchange } from 
 import { shortcutFromKeyboardEvent, transcriptFromMessages, type HistoryMessage, type HistoryPage, type SessionShortcut } from './session-shortcuts'
 import { sessionsEqual, type SessionRecord } from './sessions'
 import { supportsFastMode } from './model-settings'
+import { formatTurnActivity } from './turn-activity'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -61,6 +63,7 @@ function PromptWindow() {
   const [history, setHistory] = createSignal<Exchange[]>([])
   const [previousChat, setPreviousChat] = createSignal<PreviousChat>()
   const [busy, setBusy] = createSignal(false)
+  const [turnActivities, setTurnActivities] = createSignal<Record<string, string>>({})
   const [capturing, setCapturing] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
   const [settingsTab, setSettingsTab] = createSignal<'general' | 'shortcuts'>('general')
@@ -127,6 +130,7 @@ function PromptWindow() {
     setPreview(undefined)
     setHistory([])
     setBusy(false)
+    setTurnActivities({})
     setCapturing(false)
     setSettingsOpen(false)
     setActiveSession(sessionPreference())
@@ -250,6 +254,7 @@ function PromptWindow() {
     const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const selectedSession = activeSession()
     setHistory(items => beginExchange(items, { id: exchangeId, prompt: question, images }))
+    setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity('thinking') }))
     setPrompt('')
     setCaptures([])
     setBusy(true)
@@ -271,7 +276,13 @@ function PromptWindow() {
         },
         onDelta: text => {
           if (generation !== promptGeneration) return
+          setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity('writing') }))
           setHistory(items => appendAnswerDelta(items, exchangeId, text))
+        },
+        onActivity: (kind, toolName, context) => {
+          if (generation !== promptGeneration) return
+          setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity(kind, toolName, context) }))
+          scrollToLatest()
         },
       })
       if (generation !== promptGeneration) return
@@ -286,6 +297,11 @@ function PromptWindow() {
       const message = String(reason)
       setHistory(items => items.map(item => item.id === exchangeId ? { ...item, answer: item.answer || message, status: 'error' } : item))
     } finally {
+      setTurnActivities(items => {
+        const next = { ...items }
+        delete next[exchangeId]
+        return next
+      })
       setBusy(false)
       window.setTimeout(() => inputRef?.focus(), 20)
     }
@@ -457,8 +473,11 @@ function PromptWindow() {
                     <Show when={item.answer}>
                       <div class="answer markdown" classList={{ failed: item.status === 'error' }} innerHTML={renderMarkdown(item.answer)} />
                     </Show>
-                    <Show when={item.status === 'pending' && !item.answer}>
-                      <div class="answer-pending" aria-label="Hermes is thinking"><span /><span /><span /></div>
+                    <Show when={item.status === 'pending'}>
+                      <div class="answer-activity" role="status" aria-live="polite">
+                        <LoaderCircle size={13} />
+                        <span>{turnActivities()[item.id] || 'Thinking…'}</span>
+                      </div>
                     </Show>
                   </article>
                 )}
