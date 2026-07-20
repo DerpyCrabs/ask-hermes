@@ -105,6 +105,9 @@ struct SessionShortcutState(Mutex<Vec<SessionShortcutConfig>>);
 #[derive(Default)]
 struct SettingsWindowState(Mutex<bool>);
 
+#[derive(Default)]
+struct ActiveSessionShortcut(Mutex<Option<String>>);
+
 struct PromptWindowLayout(Mutex<PromptWindowLayoutState>);
 
 struct PromptWindowLayoutState {
@@ -724,9 +727,32 @@ fn register_session_shortcut(
         .map_err(|error| error.to_string())
 }
 
+fn should_hide_session_shortcut(visible: bool, active: Option<&str>, requested: &str) -> bool {
+    visible && active == Some(requested)
+}
+
 fn show_session_shortcut(app: &AppHandle, session_id: &str) {
+    let active_session = app
+        .state::<ActiveSessionShortcut>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|active| active.clone());
+    if let Some(window) = app.get_webview_window("main") {
+        if should_hide_session_shortcut(
+            window.is_visible().unwrap_or(false),
+            active_session.as_deref(),
+            session_id,
+        ) {
+            let _ = hide_window(app.clone());
+            return;
+        }
+    }
     if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
         *open = false;
+    }
+    if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
+        *active = Some(session_id.to_string());
     }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_size(Size::Logical(tauri::LogicalSize::new(620.0, 360.0)));
@@ -1164,6 +1190,10 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
         .0
         .lock()
         .map_err(|_| "Settings state is unavailable")? = false;
+    *app.state::<ActiveSessionShortcut>()
+        .0
+        .lock()
+        .map_err(|_| "Session shortcut state is unavailable")? = None;
     if let Some(capture) = app.get_webview_window("capture") {
         capture.hide().map_err(|error| error.to_string())?;
     }
@@ -1176,6 +1206,9 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 }
 
 fn show_settings(app: &AppHandle) {
+    if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
+        *active = None;
+    }
     if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
         *open = true;
     }
@@ -1267,6 +1300,9 @@ fn show_prompt(app: &AppHandle) {
         } else if visible {
             let _ = window.set_focus();
         } else {
+            if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
+                *active = None;
+            }
             let _ = show_main_above_capture(&window);
             let _ = window.emit("open-prompt", ());
         }
@@ -1320,12 +1356,18 @@ pub fn run() {
         .manage(SessionShortcutState::default())
         .manage(SessionShortcutTrayState::default())
         .manage(SettingsWindowState::default())
+        .manage(ActiveSessionShortcut::default())
         .manage(PromptWindowLayout::default())
         .on_window_event(|window, event| {
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     if window.label() == "main" {
+                        if let Ok(mut active) =
+                            window.app_handle().state::<ActiveSessionShortcut>().0.lock()
+                        {
+                            *active = None;
+                        }
                         if let Ok(mut open) =
                             window.app_handle().state::<SettingsWindowState>().0.lock()
                         {
@@ -1393,6 +1435,9 @@ pub fn run() {
                     match item_id {
                         "show" => show_prompt(app),
                         "previous" => {
+                            if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
+                                *active = None;
+                            }
                             if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
                                 *open = false;
                             }
@@ -1552,5 +1597,13 @@ mod tests {
         assert!(!allowed_external_url("javascript:alert(1)"));
         assert!(!allowed_external_url("file:///C:/Windows/System32"));
         assert!(!allowed_external_url("https://example.com\nmalicious"));
+    }
+
+    #[test]
+    fn session_shortcuts_toggle_only_the_same_visible_session() {
+        assert!(should_hide_session_shortcut(true, Some("chat-a"), "chat-a"));
+        assert!(!should_hide_session_shortcut(true, Some("chat-a"), "chat-b"));
+        assert!(!should_hide_session_shortcut(false, Some("chat-a"), "chat-a"));
+        assert!(!should_hide_session_shortcut(true, None, "chat-a"));
     }
 }
