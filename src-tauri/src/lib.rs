@@ -105,6 +105,24 @@ struct SessionShortcutState(Mutex<Vec<SessionShortcutConfig>>);
 #[derive(Default)]
 struct SettingsWindowState(Mutex<bool>);
 
+struct PromptWindowLayout(Mutex<PromptWindowLayoutState>);
+
+struct PromptWindowLayoutState {
+    expanded: bool,
+    expanded_width: f64,
+    expanded_height: f64,
+}
+
+impl Default for PromptWindowLayout {
+    fn default() -> Self {
+        Self(Mutex::new(PromptWindowLayoutState {
+            expanded: false,
+            expanded_width: 620.0,
+            expanded_height: 360.0,
+        }))
+    }
+}
+
 #[derive(Default)]
 struct SessionShortcutTrayState(Mutex<SessionShortcutTray>);
 
@@ -1088,11 +1106,55 @@ fn cancel_selection(app: AppHandle, state: tauri::State<'_, PendingCapture>) -> 
 }
 
 #[tauri::command]
-fn set_prompt_expanded(window: WebviewWindow, expanded: bool) -> Result<(), String> {
-    let height = if expanded { 360.0 } else { 76.0 };
-    window
-        .set_size(Size::Logical(tauri::LogicalSize::new(620.0, height)))
-        .map_err(|error| error.to_string())?;
+fn set_prompt_expanded(
+    window: WebviewWindow,
+    expanded: bool,
+    state: tauri::State<'_, PromptWindowLayout>,
+) -> Result<(), String> {
+    let mut layout = state
+        .0
+        .lock()
+        .map_err(|_| "Window layout state is unavailable")?;
+    if layout.expanded == expanded {
+        window
+            .set_resizable(expanded)
+            .map_err(|error| error.to_string())?;
+        return apply_main_shape(&window);
+    }
+
+    if expanded {
+        window
+            .set_min_size(None::<Size>)
+            .map_err(|error| error.to_string())?;
+        window
+            .set_size(Size::Logical(tauri::LogicalSize::new(
+                layout.expanded_width,
+                layout.expanded_height,
+            )))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_min_size(Some(Size::Logical(tauri::LogicalSize::new(420.0, 260.0))))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_resizable(true)
+            .map_err(|error| error.to_string())?;
+    } else {
+        if let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) {
+            let logical = size.to_logical::<f64>(scale);
+            layout.expanded_width = logical.width.max(420.0);
+            layout.expanded_height = logical.height.max(260.0);
+        }
+        window
+            .set_min_size(None::<Size>)
+            .map_err(|error| error.to_string())?;
+        window
+            .set_resizable(false)
+            .map_err(|error| error.to_string())?;
+        window
+            .set_size(Size::Logical(tauri::LogicalSize::new(620.0, 76.0)))
+            .map_err(|error| error.to_string())?;
+    }
+    layout.expanded = expanded;
     apply_main_shape(&window)
 }
 
@@ -1213,18 +1275,27 @@ pub fn run() {
         .manage(SessionShortcutState::default())
         .manage(SessionShortcutTrayState::default())
         .manage(SettingsWindowState::default())
+        .manage(PromptWindowLayout::default())
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                if window.label() == "main" {
-                    if let Ok(mut open) =
-                        window.app_handle().state::<SettingsWindowState>().0.lock()
-                    {
-                        *open = false;
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    if window.label() == "main" {
+                        if let Ok(mut open) =
+                            window.app_handle().state::<SettingsWindowState>().0.lock()
+                        {
+                            *open = false;
+                        }
+                        let _ = window.emit("clear-prompt", ());
                     }
-                    let _ = window.emit("clear-prompt", ());
+                    let _ = window.hide();
                 }
-                let _ = window.hide();
+                tauri::WindowEvent::Resized(_) if window.label() == "main" => {
+                    if let Some(main) = window.app_handle().get_webview_window("main") {
+                        let _ = apply_main_shape(&main);
+                    }
+                }
+                _ => {}
             }
         })
         .setup(move |app| {
