@@ -27,8 +27,8 @@ type TurnActivity = {
 export type TurnResult = { answer: string; runtime_session_id: string; stored_session_id: string }
 
 export function sessionStrategy(runtimeSessionId?: string, storedSessionId?: string) {
-  if (runtimeSessionId) return 'reuse' as const
   if (storedSessionId) return 'resume' as const
+  if (runtimeSessionId) return 'reuse' as const
   return 'create' as const
 }
 

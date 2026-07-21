@@ -105,7 +105,7 @@ button { color: inherit; }
   cursor: grab;
 }
 .conversation-bar button { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: #0053fd; font-size: 11px; cursor: pointer; }
-.conversation-actions { display: flex; align-items: center; gap: 5px; }
+.conversation-actions { display: flex; align-items: center; gap: 5px; margin-right: -10px; }
 .conversation-bar .conversation-close { width: 24px; height: 24px; padding: 0; display: grid; place-items: center; border-radius: 8px; color: #737986; opacity: .58; transition: opacity .12s ease, background .12s ease; }
 .conversation-bar .conversation-close:hover, .conversation-bar .conversation-close:focus-visible { opacity: 1; background: rgba(23,23,26,.055); }
 .conversation-close svg { display: block; stroke-width: 1.8; }
@@ -117,7 +117,9 @@ button { color: inherit; }
 .question { align-self: flex-end; max-width: 84%; padding: 8px 11px; border: 1px solid rgba(0,83,253,.16); border-radius: 12px 12px 4px 12px; background: rgba(0,83,253,.06); font-size: 12px; white-space: pre-wrap; }
 .question-captures { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 7px; }
 .question img { display: block; max-width: 120px; max-height: 85px; border-radius: 7px; object-fit: cover; }
-.answer { color: #27272d; font-size: 13px; line-height: 1.55; white-space: pre-wrap; user-select: text; }
+.answer, .answer * { user-select: text; }
+.answer { color: #27272d; font-size: 13px; line-height: 1.55; white-space: pre-wrap; cursor: text; }
+.answer a { cursor: pointer; }
 .answer.failed { color: #a71f3b; }
 .answer-activity { min-width: 0; height: 22px; display: flex; align-items: center; gap: 7px; color: #747b8a; font-size: 11px; }
 .answer-activity svg { flex: 0 0 auto; color: #0053fd; stroke-width: 1.8; animation: spin .9s linear infinite; }

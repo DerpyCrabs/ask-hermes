@@ -521,33 +521,23 @@ async fn ask_hermes_gateway(
         .await
         .map_err(|error| format!("Could not connect to Hermes backend: {error}"))?;
     let mut request_id = 0_u64;
-    let mut runtime_id = runtime_session_id.filter(|id| !id.trim().is_empty());
+    let supplied_runtime_id = runtime_session_id.filter(|id| !id.trim().is_empty());
+    let runtime_id: Option<String>;
     let mut stored_id = stored_session_id.filter(|id| !id.trim().is_empty());
 
-    if runtime_id.is_none() {
+    // A runtime ID is only meaningful inside the current Hermes gateway process.
+    // A stored ID is durable. Re-resume stored chats on every turn so Hermes can
+    // cheaply reuse a live runtime, recreate a reaped one, or follow a compressed
+    // session to its continuation instead of trusting stale frontend state.
+    if stored_id.is_some() {
         request_id += 1;
-        let result = if let Some(id) = stored_id.as_ref() {
-            gateway_rpc(
-                &mut socket,
-                request_id,
-                "session.resume",
-                json!({ "session_id": id, "source": "desktop" }),
-            )
-            .await?
-        } else {
-            gateway_rpc(
-                &mut socket,
-                request_id,
-                "session.create",
-                json!({
-                    "source": "desktop",
-                    "model": model.unwrap_or_default(),
-                    "reasoning_effort": reasoning_effort.unwrap_or_default(),
-                    "fast": fast.unwrap_or(false),
-                }),
-            )
-            .await?
-        };
+        let result = gateway_rpc(
+            &mut socket,
+            request_id,
+            "session.resume",
+            json!({ "session_id": stored_id.as_ref().unwrap(), "source": "desktop" }),
+        )
+        .await?;
         runtime_id = result
             .get("session_id")
             .and_then(Value::as_str)
@@ -558,6 +548,31 @@ async fn ask_hermes_gateway(
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .or(stored_id);
+    } else if supplied_runtime_id.is_some() {
+        runtime_id = supplied_runtime_id;
+    } else {
+        request_id += 1;
+        let result = gateway_rpc(
+            &mut socket,
+            request_id,
+            "session.create",
+            json!({
+                "source": "desktop",
+                "model": model.unwrap_or_default(),
+                "reasoning_effort": reasoning_effort.unwrap_or_default(),
+                "fast": fast.unwrap_or(false),
+            }),
+        )
+        .await?;
+        runtime_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        stored_id = result
+            .get("stored_session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
     }
 
     let runtime_id =

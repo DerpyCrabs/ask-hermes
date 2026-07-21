@@ -20,6 +20,7 @@ import { shortcutFromKeyboardEvent, transcriptFromMessages, type HistoryMessage,
 import { sessionsEqual, type SessionRecord } from './sessions'
 import { supportsFastMode } from './model-settings'
 import { formatTurnActivity } from './turn-activity'
+import { shouldRememberPreviousChat } from './previous-chat'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -51,6 +52,7 @@ function PromptWindow() {
   let inputRef: HTMLTextAreaElement | undefined
   let conversationRef: HTMLDivElement | undefined
   let promptGeneration = 0
+  let openedFromSessionShortcut = false
   const [sessions, setSessions] = createSignal<Session[]>([])
   const [sessionPreference, setSessionPreference] = createSignal(
     localStorage.getItem(SESSION_PREFERENCE_KEY) || NEW_SESSION,
@@ -120,10 +122,11 @@ function PromptWindow() {
 
   const clearPrompt = () => {
     const transcript = history()
-    if (transcript.length > 0) {
+    if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
       setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
       void invoke('set_previous_chat_available', { available: true })
     }
+    openedFromSessionShortcut = false
     promptGeneration += 1
     setPrompt('')
     setCaptures([])
@@ -150,12 +153,14 @@ function PromptWindow() {
       if (payload) window.setTimeout(() => inputRef?.focus(), 30)
     })
     const unlistenOpen = listen('open-prompt', () => {
+      openedFromSessionShortcut = false
       void loadSessions()
       window.setTimeout(() => inputRef?.focus(), 20)
     })
     const unlistenPrevious = listen('open-previous-chat', () => {
       const previous = previousChat()
       if (!previous) return
+      openedFromSessionShortcut = false
       promptGeneration += 1
       setPrompt('')
       setCaptures([])
@@ -177,10 +182,11 @@ function PromptWindow() {
     const unlistenSessionShortcut = listen<string>('open-session-shortcut', event => {
       const sessionId = event.payload
       const transcript = history()
-      if (transcript.length > 0) {
+      if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
         setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
         void invoke('set_previous_chat_available', { available: true })
       }
+      openedFromSessionShortcut = true
       promptGeneration += 1
       const generation = promptGeneration
       setPrompt('')
@@ -282,7 +288,6 @@ function PromptWindow() {
         onActivity: (kind, toolName, context) => {
           if (generation !== promptGeneration) return
           setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity(kind, toolName, context) }))
-          scrollToLatest()
         },
       })
       if (generation !== promptGeneration) return
@@ -435,8 +440,9 @@ function PromptWindow() {
   onCleanup(() => window.removeEventListener('keydown', globalKeys))
 
   const startDragging: JSX.EventHandler<HTMLElement, MouseEvent> = event => {
+    if (event.button !== 0) return
     const target = event.target as HTMLElement
-    if (!target.closest('a, button, input, textarea, select, .attachments, .capture-preview, .settings-panel')) {
+    if (!target.closest('button')) {
       void getCurrentWindow().startDragging()
     }
   }
@@ -450,13 +456,13 @@ function PromptWindow() {
   }
 
   return (
-      <main class="window-shell" classList={{ expanded: history().length > 0 || loadingSessionHistory() }} onMouseDown={startDragging} data-tauri-drag-region>
-        <section class="content" data-tauri-drag-region>
+      <main class="window-shell" classList={{ expanded: history().length > 0 || loadingSessionHistory() }}>
+        <section class="content">
           <Show when={history().length || loadingSessionHistory()}>
             <div class="conversation" ref={conversationRef} onClick={openAnswerLink} onScroll={event => {
               if (event.currentTarget.scrollTop < 36) void loadOlderHistory()
             }}>
-              <div class="conversation-bar drag-zone" data-tauri-drag-region>
+              <div class="conversation-bar drag-zone" onMouseDown={startDragging} data-tauri-drag-region>
                 <span>Ask Hermes</span>
                 <div class="conversation-actions">
                   <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes <ExternalLink size={12} /></button></Show>
@@ -493,8 +499,8 @@ function PromptWindow() {
             </div>
           </Show>
 
-          <div class="composer" data-tauri-drag-region>
-            <div class="brand-mark drag-zone" title="Drag Ask Hermes" data-tauri-drag-region>
+          <div class="composer">
+            <div class="brand-mark drag-zone" title="Drag Ask Hermes" onMouseDown={startDragging} data-tauri-drag-region>
               <img src={hermesIcon} alt="Hermes" draggable={false} />
             </div>
             <Show when={captures().length}>
