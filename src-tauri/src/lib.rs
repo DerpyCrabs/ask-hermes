@@ -41,6 +41,8 @@ struct HermesSession {
 #[derive(Debug, Clone, Serialize)]
 struct HermesGatewayConnection {
     ws_url: String,
+    http_url: String,
+    token: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +73,42 @@ struct HermesTurnResponse {
     stored_session_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HermesTurnRequest {
+    exchange_id: String,
+    prompt: String,
+    image_data_urls: Vec<String>,
+    stored_session_id: Option<String>,
+    runtime_session_id: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    fast: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceInputConfig {
+    max_recording_seconds: u64,
+    stt_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct VoiceTranscription {
+    transcript: String,
+}
+
+const SPEACHES_MODEL: &str = "deepdml/faster-whisper-large-v3-turbo-ct2";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeachesStatus {
+    installed: bool,
+    running: bool,
+    model: &'static str,
+    websocket_url: String,
+}
+
 struct HermesBackendProcess {
     child: Child,
     connection: HermesGatewayConnection,
@@ -86,6 +124,36 @@ impl Drop for HermesBackend {
                 let _ = backend.child.kill();
             }
         }
+    }
+}
+
+struct SpeachesProcess {
+    child: Child,
+    #[cfg(windows)]
+    _job: WindowsKillJob,
+}
+
+#[derive(Default)]
+struct SpeachesBackend(Mutex<Option<SpeachesProcess>>);
+
+impl Drop for SpeachesBackend {
+    fn drop(&mut self) {
+        if let Ok(slot) = self.0.get_mut() {
+            if let Some(process) = slot.as_mut() {
+                let _ = process.child.kill();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsKillJob(isize);
+
+#[cfg(windows)]
+impl Drop for WindowsKillJob {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        let _ = unsafe { CloseHandle(HANDLE(self.0 as *mut _)) };
     }
 }
 
@@ -112,6 +180,7 @@ struct PromptWindowLayout(Mutex<PromptWindowLayoutState>);
 
 struct PromptWindowLayoutState {
     expanded: bool,
+    settings: bool,
     expanded_width: f64,
     expanded_height: f64,
 }
@@ -120,6 +189,7 @@ impl Default for PromptWindowLayout {
     fn default() -> Self {
         Self(Mutex::new(PromptWindowLayoutState {
             expanded: false,
+            settings: false,
             expanded_width: 620.0,
             expanded_height: 360.0,
         }))
@@ -442,6 +512,8 @@ fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
         child,
         connection: HermesGatewayConnection {
             ws_url: format!("ws://127.0.0.1:{port}/api/ws?token={token}"),
+            http_url: format!("http://127.0.0.1:{port}"),
+            token,
         },
     })
 }
@@ -465,6 +537,341 @@ fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConne
     let connection = backend.connection.clone();
     *slot = Some(backend);
     Ok(connection)
+}
+
+fn transcription_timeout(data_url_len: usize) -> Duration {
+    Duration::from_millis(((data_url_len as u64) / 10).clamp(180_000, 600_000))
+}
+
+async fn hermes_http_json(
+    connection: &HermesGatewayConnection,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| format!("Could not prepare Hermes request: {error}"))?;
+    let mut request = client
+        .request(method, format!("{}{}", connection.http_url, path))
+        .header("X-Hermes-Session-Token", &connection.token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach Hermes voice service: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Hermes returned an invalid voice response: {error}"))?;
+    if !status.is_success() {
+        let message = payload
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("Hermes voice request failed");
+        return Err(message.to_string());
+    }
+    Ok(payload)
+}
+
+#[tauri::command]
+async fn get_voice_input_config(
+    state: tauri::State<'_, HermesBackend>,
+) -> Result<VoiceInputConfig, String> {
+    let connection = hermes_gateway_connection(&state)?;
+    let config = hermes_http_json(
+        &connection,
+        reqwest::Method::GET,
+        "/api/config",
+        None,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let seconds = config
+        .pointer("/voice/max_recording_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .clamp(1, 600);
+    let stt_enabled = config
+        .pointer("/stt/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    Ok(VoiceInputConfig {
+        max_recording_seconds: seconds,
+        stt_enabled,
+    })
+}
+
+#[tauri::command]
+async fn transcribe_voice_audio(
+    state: tauri::State<'_, HermesBackend>,
+    data_url: String,
+    mime_type: String,
+) -> Result<VoiceTranscription, String> {
+    let connection = hermes_gateway_connection(&state)?;
+    let timeout = transcription_timeout(data_url.len());
+    let response = hermes_http_json(
+        &connection,
+        reqwest::Method::POST,
+        "/api/audio/transcribe",
+        Some(json!({ "data_url": data_url, "mime_type": mime_type })),
+        timeout,
+    )
+    .await?;
+    Ok(VoiceTranscription {
+        transcript: response
+            .get("transcript")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    })
+}
+
+fn speaches_root() -> Result<PathBuf, String> {
+    let local_app_data = env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "Windows local application data directory is unavailable".to_string())?;
+    Ok(PathBuf::from(local_app_data)
+        .join("Ask Hermes")
+        .join("Speaches"))
+}
+
+fn speaches_python() -> Result<PathBuf, String> {
+    let python = speaches_root()?
+        .join(".venv")
+        .join("Scripts")
+        .join("python.exe");
+    if python.is_file() {
+        Ok(python)
+    } else {
+        Err("Native Speaches is not installed".to_string())
+    }
+}
+
+async fn speaches_is_running() -> bool {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    client
+        .get("http://127.0.0.1:8000/health")
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, String> {
+    use std::{mem::size_of, os::windows::io::AsRawHandle};
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::{
+                Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32,
+                    TH32CS_SNAPTHREAD,
+                },
+                JobObjects::{
+                    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                },
+                Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+            },
+        },
+    };
+
+    let job_handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map_err(|error| format!("Could not create Speaches process job: {error}"))?;
+    let job = WindowsKillJob(job_handle.0 as isize);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|error| format!("Could not configure Speaches process job: {error}"))?;
+        AssignProcessToJobObject(job_handle, HANDLE(child.as_raw_handle()))
+            .map_err(|error| format!("Could not assign Speaches to its process job: {error}"))?;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .map_err(|error| format!("Could not inspect the suspended Speaches process: {error}"))?;
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_id = None;
+    if unsafe { Thread32First(snapshot, &mut entry) }.is_ok() {
+        loop {
+            if entry.th32OwnerProcessID == child.id() {
+                thread_id = Some(entry.th32ThreadID);
+                break;
+            }
+            if unsafe { Thread32Next(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    let thread_id = thread_id.ok_or_else(|| "Could not find the suspended Speaches thread".to_string())?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
+        .map_err(|error| format!("Could not open the suspended Speaches thread: {error}"))?;
+    let resume_result = unsafe { ResumeThread(thread) };
+    let _ = unsafe { CloseHandle(thread) };
+    if resume_result == u32::MAX {
+        return Err("Could not resume the Speaches process".to_string());
+    }
+    Ok(job)
+}
+
+fn spawn_speaches() -> Result<SpeachesProcess, String> {
+    let root = speaches_root()?;
+    let python = speaches_python()?;
+    let cublas = root
+        .join(".venv")
+        .join("Lib")
+        .join("site-packages")
+        .join("nvidia")
+        .join("cublas")
+        .join("bin");
+    let cudnn = root
+        .join(".venv")
+        .join("Lib")
+        .join("site-packages")
+        .join("nvidia")
+        .join("cudnn")
+        .join("bin");
+    let inherited_path = env::var_os("PATH").unwrap_or_default();
+    let search_paths = [cublas, cudnn]
+        .into_iter()
+        .chain(env::split_paths(&inherited_path));
+    let search_path = env::join_paths(search_paths)
+        .map_err(|error| format!("Could not configure Speaches CUDA libraries: {error}"))?;
+
+    let mut command = Command::new(python);
+    command
+        .current_dir(&root)
+        .args([
+            "-m",
+            "uvicorn",
+            "speaches.main:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8000",
+            "--log-level",
+            "warning",
+        ])
+        .env("PATH", search_path)
+        .env("WHISPER__INFERENCE_DEVICE", "cuda")
+        .env("WHISPER__COMPUTE_TYPE", "float16")
+        .env("STT_MODEL_TTL", "-1")
+        .env("ENABLE_UI", "false")
+        .env("LOOPBACK_HOST_URL", "http://127.0.0.1:8000")
+        .env("HF_HOME", root.join("models"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        command.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start native Speaches: {error}"))?;
+    #[cfg(windows)]
+    let job = match assign_speaches_job_and_resume(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(error);
+        }
+    };
+    Ok(SpeachesProcess {
+        child,
+        #[cfg(windows)]
+        _job: job,
+    })
+}
+
+#[tauri::command]
+async fn get_speaches_status() -> SpeachesStatus {
+    let installed = speaches_python().is_ok();
+    SpeachesStatus {
+        installed,
+        running: installed && speaches_is_running().await,
+        model: SPEACHES_MODEL,
+        websocket_url: format!(
+            "ws://127.0.0.1:8000/v1/realtime?model={SPEACHES_MODEL}&intent=transcription"
+        ),
+    }
+}
+
+#[tauri::command]
+async fn ensure_speaches(
+    state: tauri::State<'_, SpeachesBackend>,
+) -> Result<SpeachesStatus, String> {
+    speaches_python()?;
+    if !speaches_is_running().await {
+        let should_spawn = {
+            let mut slot = state
+                .0
+                .lock()
+                .map_err(|_| "Speaches process state is unavailable")?;
+            match slot.as_mut() {
+                Some(process) => process
+                    .child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+                None => true,
+            }
+        };
+        if should_spawn {
+            let process = spawn_speaches()?;
+            *state
+                .0
+                .lock()
+                .map_err(|_| "Speaches process state is unavailable")? = Some(process);
+        }
+        let mut ready = false;
+        for _ in 0..120 {
+            if speaches_is_running().await {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !ready {
+            return Err("Native Speaches did not become ready".to_string());
+        }
+    }
+    Ok(SpeachesStatus {
+        installed: true,
+        running: true,
+        model: SPEACHES_MODEL,
+        websocket_url: format!(
+            "ws://127.0.0.1:8000/v1/realtime?model={SPEACHES_MODEL}&intent=transcription"
+        ),
+    })
 }
 
 async fn gateway_rpc<S>(
@@ -507,15 +914,18 @@ where
 async fn ask_hermes_gateway(
     app: AppHandle,
     state: tauri::State<'_, HermesBackend>,
-    exchange_id: String,
-    prompt: String,
-    image_data_urls: Vec<String>,
-    stored_session_id: Option<String>,
-    runtime_session_id: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    fast: Option<bool>,
+    request: HermesTurnRequest,
 ) -> Result<HermesTurnResponse, String> {
+    let HermesTurnRequest {
+        exchange_id,
+        prompt,
+        image_data_urls,
+        stored_session_id,
+        runtime_session_id,
+        model,
+        reasoning_effort,
+        fast,
+    } = request;
     let connection = hermes_gateway_connection(&state)?;
     let (mut socket, _) = connect_async(&connection.ws_url)
         .await
@@ -1150,13 +1560,38 @@ fn cancel_selection(app: AppHandle, state: tauri::State<'_, PendingCapture>) -> 
 fn set_prompt_expanded(
     window: WebviewWindow,
     expanded: bool,
+    settings: bool,
     state: tauri::State<'_, PromptWindowLayout>,
 ) -> Result<(), String> {
     let mut layout = state
         .0
         .lock()
         .map_err(|_| "Window layout state is unavailable")?;
-    if layout.expanded == expanded {
+    if settings {
+        let entering_settings = !layout.settings;
+        window
+            .set_min_size(None::<Size>)
+            .map_err(|error| error.to_string())?;
+        window
+            .set_size(Size::Logical(tauri::LogicalSize::new(760.0, 560.0)))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_min_size(Some(Size::Logical(tauri::LogicalSize::new(620.0, 460.0))))
+            .map_err(|error| error.to_string())?;
+        window
+            .set_resizable(true)
+            .map_err(|error| error.to_string())?;
+        if entering_settings {
+            window.center().map_err(|error| error.to_string())?;
+        }
+        layout.expanded = true;
+        layout.settings = true;
+        return apply_main_shape(&window);
+    }
+
+    let leaving_settings = layout.settings;
+    layout.settings = false;
+    if layout.expanded == expanded && !leaving_settings {
         window
             .set_resizable(expanded)
             .map_err(|error| error.to_string())?;
@@ -1180,10 +1615,12 @@ fn set_prompt_expanded(
             .set_resizable(true)
             .map_err(|error| error.to_string())?;
     } else {
-        if let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) {
-            let logical = size.to_logical::<f64>(scale);
-            layout.expanded_width = logical.width.max(420.0);
-            layout.expanded_height = logical.height.max(260.0);
+        if !leaving_settings {
+            if let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) {
+                let logical = size.to_logical::<f64>(scale);
+                layout.expanded_width = logical.width.max(420.0);
+                layout.expanded_height = logical.height.max(260.0);
+            }
         }
         window
             .set_min_size(None::<Size>)
@@ -1350,8 +1787,8 @@ fn tray_icon() -> Image<'static> {
 }
 
 pub fn run() {
-    let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-    let registered_shortcut = shortcut.clone();
+    let prompt_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+    let registered_prompt_shortcut = prompt_shortcut;
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -1359,7 +1796,7 @@ pub fn run() {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if pressed == &shortcut {
+                    if pressed == &prompt_shortcut {
                         show_prompt(app);
                     }
                 })
@@ -1367,38 +1804,40 @@ pub fn run() {
         )
         .manage(PendingCapture::default())
         .manage(HermesBackend::default())
+        .manage(SpeachesBackend::default())
         .manage(PreviousChatMenu::default())
         .manage(SessionShortcutState::default())
         .manage(SessionShortcutTrayState::default())
         .manage(SettingsWindowState::default())
         .manage(ActiveSessionShortcut::default())
         .manage(PromptWindowLayout::default())
-        .on_window_event(|window, event| {
-            match event {
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    if window.label() == "main" {
-                        if let Ok(mut active) =
-                            window.app_handle().state::<ActiveSessionShortcut>().0.lock()
-                        {
-                            *active = None;
-                        }
-                        if let Ok(mut open) =
-                            window.app_handle().state::<SettingsWindowState>().0.lock()
-                        {
-                            *open = false;
-                        }
-                        let _ = window.emit("clear-prompt", ());
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                if window.label() == "main" {
+                    if let Ok(mut active) = window
+                        .app_handle()
+                        .state::<ActiveSessionShortcut>()
+                        .0
+                        .lock()
+                    {
+                        *active = None;
                     }
-                    let _ = window.hide();
-                }
-                tauri::WindowEvent::Resized(_) if window.label() == "main" => {
-                    if let Some(main) = window.app_handle().get_webview_window("main") {
-                        let _ = apply_main_shape(&main);
+                    if let Ok(mut open) =
+                        window.app_handle().state::<SettingsWindowState>().0.lock()
+                    {
+                        *open = false;
                     }
+                    let _ = window.emit("clear-prompt", ());
                 }
-                _ => {}
+                let _ = window.hide();
             }
+            tauri::WindowEvent::Resized(_) if window.label() == "main" => {
+                if let Some(main) = window.app_handle().get_webview_window("main") {
+                    let _ = apply_main_shape(&main);
+                }
+            }
+            _ => {}
         })
         .setup(move |app| {
             #[cfg(windows)]
@@ -1407,7 +1846,7 @@ pub fn run() {
                 None,
             ))?;
 
-            app.global_shortcut().register(registered_shortcut)?;
+            app.global_shortcut().register(registered_prompt_shortcut)?;
 
             let show = MenuItem::with_id(app, "show", "Open Ask Hermes", true, None::<&str>)?;
             let previous =
@@ -1488,6 +1927,10 @@ pub fn run() {
             hermes_desktop_available,
             get_session_history_page,
             set_session_shortcuts,
+            get_voice_input_config,
+            transcribe_voice_audio,
+            get_speaches_status,
+            ensure_speaches,
             ask_hermes_gateway,
             set_previous_chat_available,
             start_selection,
@@ -1506,6 +1949,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_kill_job_terminates_its_suspended_process() {
+        use std::{os::windows::process::CommandExt, time::Instant};
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0)
+            .spawn()
+            .expect("test process should start suspended");
+        let job = assign_speaches_job_and_resume(&child).expect("test process should enter the job");
+        assert!(child.try_wait().unwrap().is_none());
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        panic!("closing the job did not terminate its process");
+    }
 
     fn session_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
@@ -1601,7 +2069,33 @@ mod tests {
     #[test]
     fn accepts_shortcut_strings_recorded_by_the_settings_ui() {
         assert!("Ctrl+Alt+H".parse::<Shortcut>().is_ok());
+        assert!("Ctrl+Shift+D".parse::<Shortcut>().is_ok());
         assert!("Shift+F8".parse::<Shortcut>().is_ok());
+    }
+
+    #[test]
+    fn voice_transcription_timeout_is_bounded() {
+        assert_eq!(transcription_timeout(1), Duration::from_secs(180));
+        assert_eq!(transcription_timeout(3_000_000), Duration::from_secs(300));
+        assert_eq!(transcription_timeout(99_000_000), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn accepts_nested_frontend_turn_request() {
+        let request: HermesTurnRequest = serde_json::from_value(json!({
+            "exchangeId": "exchange-1",
+            "prompt": "hello",
+            "imageDataUrls": ["data:image/png;base64,AA=="],
+            "storedSessionId": null,
+            "runtimeSessionId": "runtime-1",
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "low",
+            "fast": true
+        }))
+        .unwrap();
+        assert_eq!(request.exchange_id, "exchange-1");
+        assert_eq!(request.image_data_urls.len(), 1);
+        assert_eq!(request.fast, Some(true));
     }
 
     #[test]
@@ -1617,8 +2111,16 @@ mod tests {
     #[test]
     fn session_shortcuts_toggle_only_the_same_visible_session() {
         assert!(should_hide_session_shortcut(true, Some("chat-a"), "chat-a"));
-        assert!(!should_hide_session_shortcut(true, Some("chat-a"), "chat-b"));
-        assert!(!should_hide_session_shortcut(false, Some("chat-a"), "chat-a"));
+        assert!(!should_hide_session_shortcut(
+            true,
+            Some("chat-a"),
+            "chat-b"
+        ));
+        assert!(!should_hide_session_shortcut(
+            false,
+            Some("chat-a"),
+            "chat-a"
+        ));
         assert!(!should_hide_session_shortcut(true, None, "chat-a"));
     }
 }

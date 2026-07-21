@@ -48,14 +48,16 @@ export async function runHermesTurn(options: TurnOptions) {
   })
   try {
     const result = await invoke<TurnResult>('ask_hermes_gateway', {
-      exchangeId: options.exchangeId,
-      prompt: options.prompt,
-      imageDataUrls: options.images,
-      storedSessionId: options.storedSessionId,
-      runtimeSessionId: options.runtimeSessionId,
-      model: options.model,
-      reasoningEffort: options.reasoningEffort,
-      fast: options.fast,
+      request: {
+        exchangeId: options.exchangeId,
+        prompt: options.prompt,
+        imageDataUrls: options.images,
+        storedSessionId: options.storedSessionId,
+        runtimeSessionId: options.runtimeSessionId,
+        model: options.model,
+        reasoningEffort: options.reasoningEffort,
+        fast: options.fast,
+      },
     })
     return {
       answer: result.answer,

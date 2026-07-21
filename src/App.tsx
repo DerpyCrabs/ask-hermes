@@ -9,6 +9,8 @@ import Camera from 'lucide-solid/icons/camera'
 import ChevronDown from 'lucide-solid/icons/chevron-down'
 import ExternalLink from 'lucide-solid/icons/external-link'
 import LoaderCircle from 'lucide-solid/icons/loader-circle'
+import Mic from 'lucide-solid/icons/mic'
+import Square from 'lucide-solid/icons/square'
 import X from 'lucide-solid/icons/x'
 import { NEW_SESSION, normalizeSelection } from './selection'
 import { appendCapture, clipboardImageFiles, imageFileToCapture, removeCaptureAt, type Capture } from './captures'
@@ -21,18 +23,27 @@ import { sessionsEqual, type SessionRecord } from './sessions'
 import { supportsFastMode } from './model-settings'
 import { formatTurnActivity } from './turn-activity'
 import { shouldRememberPreviousChat } from './previous-chat'
+import { HermesRecording, HermesSilenceDetector, VoiceStartGate, blobToDataUrl, isVoiceInputShortcut, microphoneErrorMessage, normalizedVoiceLevel, preferredAudioMimeType, voiceInputTooltip, type VoiceInputStatus } from './voice-input'
+import { SpeachesRealtimeSession, speachesRealtimeUrl } from './speaches-realtime'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
 
 type Selection = { x: number; y: number; width: number; height: number }
 type PreviousChat = { history: Exchange[]; activeSession: string; runtimeSession?: string }
+type VoiceConfig = { maxRecordingSeconds: number; sttEnabled: boolean }
+type VoiceTranscription = { transcript: string }
+type VoiceProvider = 'hermes' | 'speaches'
+type SpeachesStatus = { installed: boolean; running: boolean; model: string; websocketUrl: string }
 
 const SESSION_PREFERENCE_KEY = 'ask-hermes.session-preference.v2'
 const MODEL_KEY = 'ask-hermes.model'
 const EFFORT_KEY = 'ask-hermes.reasoning-effort'
 const FAST_KEY = 'ask-hermes.fast-mode'
 const SESSION_SHORTCUTS_KEY = 'ask-hermes.session-shortcuts.v1'
+const VOICE_PROVIDER_KEY = 'ask-hermes.voice-provider'
+const SPEACHES_ENGLISH_KEY = 'ask-hermes.speaches-force-english'
+const VOICE_AUTO_START_KEY = 'ask-hermes.voice-auto-start'
 
 function storedSessionShortcuts(): SessionShortcut[] {
   try {
@@ -53,6 +64,18 @@ function PromptWindow() {
   let conversationRef: HTMLDivElement | undefined
   let promptGeneration = 0
   let openedFromSessionShortcut = false
+  let hermesRecording: HermesRecording | undefined
+  let voiceStartedAt = 0
+  let voiceInterval: number | undefined
+  let voiceTimeout: number | undefined
+  let voiceAudioContext: AudioContext | undefined
+  let voiceMeterSource: MediaStreamAudioSourceNode | undefined
+  let voiceMeterFrame: number | undefined
+  let voiceGeneration = 0
+  let speachesSession: SpeachesRealtimeSession | undefined
+  let activeVoiceProvider: VoiceProvider | undefined
+  let streamingTranscript = ''
+  const voiceStartGate = new VoiceStartGate()
   const [sessions, setSessions] = createSignal<Session[]>([])
   const [sessionPreference, setSessionPreference] = createSignal(
     localStorage.getItem(SESSION_PREFERENCE_KEY) || NEW_SESSION,
@@ -68,7 +91,7 @@ function PromptWindow() {
   const [turnActivities, setTurnActivities] = createSignal<Record<string, string>>({})
   const [capturing, setCapturing] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
-  const [settingsTab, setSettingsTab] = createSignal<'general' | 'shortcuts'>('general')
+  const [settingsTab, setSettingsTab] = createSignal<'general' | 'voice' | 'shortcuts'>('general')
   const [model, setModel] = createSignal(localStorage.getItem(MODEL_KEY) || 'gpt-5.6-terra')
   const [effort, setEffort] = createSignal(localStorage.getItem(EFFORT_KEY) || 'low')
   const [fastMode, setFastMode] = createSignal(localStorage.getItem(FAST_KEY) === 'true')
@@ -81,6 +104,18 @@ function PromptWindow() {
   const [loadingSessionHistory, setLoadingSessionHistory] = createSignal(false)
   const [error, setError] = createSignal('')
   const [desktopAvailable, setDesktopAvailable] = createSignal(false)
+  const [voiceStatus, setVoiceStatus] = createSignal<VoiceInputStatus>('idle')
+  const [voiceElapsed, setVoiceElapsed] = createSignal(0)
+  const [voiceProvider, setVoiceProvider] = createSignal<VoiceProvider>(
+    localStorage.getItem(VOICE_PROVIDER_KEY) === 'speaches' ? 'speaches' : 'hermes',
+  )
+  const [speachesStatus, setSpeachesStatus] = createSignal<SpeachesStatus>()
+  const [speachesForceEnglish, setSpeachesForceEnglish] = createSignal(
+    localStorage.getItem(SPEACHES_ENGLISH_KEY) === 'true',
+  )
+  const [voiceAutoStart, setVoiceAutoStart] = createSignal(
+    localStorage.getItem(VOICE_AUTO_START_KEY) === 'true',
+  )
 
   const loadSessions = async () => {
     try {
@@ -120,7 +155,269 @@ function PromptWindow() {
     window.setTimeout(scroll, 120)
   }
 
+  const clearVoiceTimers = () => {
+    if (voiceInterval !== undefined) window.clearInterval(voiceInterval)
+    if (voiceTimeout !== undefined) window.clearTimeout(voiceTimeout)
+    voiceInterval = undefined
+    voiceTimeout = undefined
+  }
+
+  const releaseVoiceResources = () => {
+    if (voiceMeterFrame !== undefined) window.cancelAnimationFrame(voiceMeterFrame)
+    voiceMeterFrame = undefined
+    voiceMeterSource?.disconnect()
+    voiceMeterSource = undefined
+    void voiceAudioContext?.close()
+    voiceAudioContext = undefined
+    clearVoiceTimers()
+  }
+
+  const startHermesSilenceMeter = (stream: MediaStream, generation: number) => {
+    let context: AudioContext | undefined
+    let source: MediaStreamAudioSourceNode | undefined
+    try {
+      context = new AudioContext()
+      const analyser = context.createAnalyser()
+      source = context.createMediaStreamSource(stream)
+      analyser.fftSize = 256
+      const samples = new Uint8Array(analyser.fftSize)
+      const detector = new HermesSilenceDetector(voiceStartedAt)
+      source.connect(analyser)
+      voiceAudioContext = context
+      voiceMeterSource = source
+      void context.resume()
+      const tick = () => {
+        if (generation !== voiceGeneration || activeVoiceProvider !== 'hermes' || voiceStatus() !== 'recording') return
+        analyser.getByteTimeDomainData(samples)
+        const result = detector.update(normalizedVoiceLevel(samples), Date.now())
+        if (result === 'speech-ended') {
+          void stopVoiceInput()
+          return
+        }
+        if (result === 'idle-timeout') {
+          cancelVoiceInput()
+          return
+        }
+        voiceMeterFrame = window.requestAnimationFrame(tick)
+      }
+      tick()
+    } catch {
+      source?.disconnect()
+      void context?.close()
+      voiceMeterSource = undefined
+      voiceAudioContext = undefined
+    }
+  }
+
+  const cancelVoiceInput = () => {
+    voiceGeneration += 1
+    voiceStartGate.cancel()
+    hermesRecording?.cancel()
+    hermesRecording = undefined
+    releaseVoiceResources()
+    speachesSession?.cancel()
+    speachesSession = undefined
+    activeVoiceProvider = undefined
+    setVoiceElapsed(0)
+    setVoiceStatus('idle')
+  }
+
+  const applyVoiceTranscript = (transcript: string) => {
+    const text = transcript.trim()
+    if (!text) throw new Error('No speech was detected')
+    setPrompt(current => current.trim() ? `${current.trimEnd()} ${text}` : text)
+    setError('')
+  }
+
+  const stopVoiceInput = async () => {
+    if (voiceStatus() !== 'recording') return
+    if (activeVoiceProvider === 'speaches' && speachesSession) {
+      setVoiceStatus('transcribing')
+      clearVoiceTimers()
+      speachesSession.stop()
+      return
+    }
+    if (!hermesRecording) return
+    const generation = voiceGeneration
+    const recording = hermesRecording
+    setVoiceStatus('transcribing')
+    clearVoiceTimers()
+    releaseVoiceResources()
+    const blob = await recording.stop()
+    if (generation !== voiceGeneration) return
+    if (hermesRecording === recording) hermesRecording = undefined
+    if (!blob || blob.size === 0) {
+      setError('No audio was recorded')
+      setVoiceStatus('idle')
+      return
+    }
+    try {
+      const dataUrl = await blobToDataUrl(blob)
+      const result = await invoke<VoiceTranscription>('transcribe_voice_audio', {
+        dataUrl,
+        mimeType: blob.type || 'audio/webm',
+      })
+      if (generation !== voiceGeneration) return
+      applyVoiceTranscript(result.transcript)
+    } catch (reason) {
+      if (generation === voiceGeneration) setError(`Voice input: ${String(reason)}`)
+    } finally {
+      if (generation === voiceGeneration) {
+        activeVoiceProvider = undefined
+        setVoiceStatus('idle')
+        setVoiceElapsed(0)
+        window.setTimeout(() => inputRef?.focus(), 20)
+      }
+    }
+  }
+
+  const startSpeachesVoiceInput = async (generation: number) => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === 'undefined') {
+      throw new Error('Voice recording is not supported on this system')
+    }
+    const status = invoke<SpeachesStatus>('ensure_speaches').then(result => {
+      setSpeachesStatus(result)
+      return result
+    })
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    })
+    if (generation !== voiceGeneration) {
+      stream.getTracks().forEach(track => track.stop())
+      return
+    }
+    streamingTranscript = ''
+    const session = new SpeachesRealtimeSession({
+      onSpeechStopped: () => {
+        if (generation !== voiceGeneration) return
+        setVoiceStatus('transcribing')
+        clearVoiceTimers()
+      },
+      onTranscriptDelta: delta => {
+        if (generation !== voiceGeneration) return
+        streamingTranscript += delta
+        setPrompt(streamingTranscript)
+      },
+      onComplete: transcript => {
+        if (generation !== voiceGeneration) return
+        try {
+          setPrompt('')
+          applyVoiceTranscript(transcript)
+        } catch (reason) {
+          setError(`Voice input: ${String(reason)}`)
+        }
+        speachesSession = undefined
+        activeVoiceProvider = undefined
+        setVoiceStatus('idle')
+        setVoiceElapsed(0)
+        clearVoiceTimers()
+        window.setTimeout(() => inputRef?.focus(), 20)
+      },
+      onError: message => {
+        if (generation !== voiceGeneration) return
+        speachesSession = undefined
+        activeVoiceProvider = undefined
+        setVoiceStatus('idle')
+        setVoiceElapsed(0)
+        clearVoiceTimers()
+        setError(`Voice input: ${message}`)
+      },
+    })
+    speachesSession = session
+    activeVoiceProvider = 'speaches'
+    voiceStartedAt = Date.now()
+    setVoiceElapsed(0)
+    setVoiceStatus('recording')
+    voiceInterval = window.setInterval(() => setVoiceElapsed((Date.now() - voiceStartedAt) / 1000), 250)
+    voiceTimeout = window.setTimeout(() => void stopVoiceInput(), 120_000)
+    await session.start(
+      status.then(result => speachesRealtimeUrl(result.websocketUrl, speachesForceEnglish())),
+      stream,
+    )
+    if (generation !== voiceGeneration) session.cancel()
+  }
+
+  const startHermesVoiceInput = async (generation: number) => {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+        throw new Error('Voice recording is not supported on this system')
+      }
+      const config = invoke<VoiceConfig>('get_voice_input_config').then(
+        value => ({ value }),
+        reason => ({ reason }),
+      )
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
+      if (generation !== voiceGeneration) {
+        stream.getTracks().forEach(track => track.stop())
+        return
+      }
+      const mimeType = preferredAudioMimeType(type => MediaRecorder.isTypeSupported(type))
+      let recorder: MediaRecorder
+      try {
+        recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+      } catch (reason) {
+        stream.getTracks().forEach(track => track.stop())
+        throw reason
+      }
+      activeVoiceProvider = 'hermes'
+      const recording = new HermesRecording(recorder, stream, mimeType, () => {
+        releaseVoiceResources()
+        if (hermesRecording === recording) hermesRecording = undefined
+        if (generation === voiceGeneration) {
+          activeVoiceProvider = undefined
+          setError('Voice input: recording failed')
+          setVoiceStatus('idle')
+        }
+      })
+      hermesRecording = recording
+      recording.start()
+      voiceStartedAt = Date.now()
+      setVoiceElapsed(0)
+      setVoiceStatus('recording')
+      voiceInterval = window.setInterval(() => setVoiceElapsed((Date.now() - voiceStartedAt) / 1000), 250)
+      startHermesSilenceMeter(stream, generation)
+      const configResult = await config
+      if (generation !== voiceGeneration || voiceStatus() !== 'recording') return
+      if ('reason' in configResult) throw configResult.reason
+      const resolvedConfig = configResult.value
+      if (!resolvedConfig.sttEnabled) throw new Error('Speech-to-text is disabled in Hermes')
+      const maxSeconds = Math.min(600, Math.max(1, resolvedConfig.maxRecordingSeconds || 120))
+      voiceTimeout = window.setTimeout(() => void stopVoiceInput(), maxSeconds * 1000)
+  }
+
+  const startVoiceInput = async () => {
+    if (voiceStatus() !== 'idle' || prompt().trim() || busy() || capturing()) return
+    const generation = voiceGeneration + 1
+    if (!voiceStartGate.tryStart(generation)) return
+    voiceGeneration = generation
+    setError('')
+    try {
+      if (voiceProvider() === 'speaches') await startSpeachesVoiceInput(generation)
+      else await startHermesVoiceInput(generation)
+    } catch (reason) {
+      if (generation === voiceGeneration) {
+        speachesSession?.cancel()
+        speachesSession = undefined
+        activeVoiceProvider = undefined
+        hermesRecording?.cancel()
+        hermesRecording = undefined
+        releaseVoiceResources()
+        setVoiceStatus('idle')
+        setError(`Voice input: ${microphoneErrorMessage(reason)}`)
+      }
+    } finally {
+      voiceStartGate.finish(generation)
+    }
+  }
+
+  const toggleVoiceInput = () => {
+    if (voiceStatus() === 'recording') void stopVoiceInput()
+    else if (voiceStatus() === 'idle') void startVoiceInput()
+  }
+
   const clearPrompt = () => {
+    cancelVoiceInput()
     const transcript = history()
     if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
       setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
@@ -156,6 +453,7 @@ function PromptWindow() {
       openedFromSessionShortcut = false
       void loadSessions()
       window.setTimeout(() => inputRef?.focus(), 20)
+      if (voiceAutoStart()) window.setTimeout(() => void startVoiceInput(), 40)
     })
     const unlistenPrevious = listen('open-previous-chat', () => {
       const previous = previousChat()
@@ -231,6 +529,7 @@ function PromptWindow() {
       setSettingsOpen(true)
       void loadSessions()
       void isAutostartEnabled().then(setStartAtLogin).catch(reason => setError(String(reason)))
+      void invoke<SpeachesStatus>('get_speaches_status').then(setSpeachesStatus).catch(() => setSpeachesStatus(undefined))
     })
     onCleanup(() => void unlisten.then(dispose => dispose()))
     onCleanup(() => void unlistenOpen.then(dispose => dispose()))
@@ -240,6 +539,7 @@ function PromptWindow() {
     onCleanup(() => void unlistenCapture.then(dispose => dispose()))
     onCleanup(() => void unlistenCaptureReady.then(dispose => dispose()))
     onCleanup(() => void unlistenSettings.then(dispose => dispose()))
+    onCleanup(cancelVoiceInput)
   })
 
   createEffect(() => {
@@ -249,7 +549,10 @@ function PromptWindow() {
   })
 
   createEffect(() => {
-    void invoke('set_prompt_expanded', { expanded: history().length > 0 || loadingSessionHistory() || Boolean(preview()) || settingsOpen() })
+    void invoke('set_prompt_expanded', {
+      expanded: history().length > 0 || loadingSessionHistory() || Boolean(preview()) || settingsOpen(),
+      settings: settingsOpen(),
+    })
   })
 
   const submit = async () => {
@@ -329,7 +632,7 @@ function PromptWindow() {
   }
 
   async function beginCapture() {
-    if (capturing() || busy()) return
+    if (capturing() || busy() || voiceStatus() !== 'idle') return
     setError('')
     setCapturing(true)
     try {
@@ -359,6 +662,9 @@ function PromptWindow() {
       localStorage.setItem(MODEL_KEY, model())
       localStorage.setItem(EFFORT_KEY, effort())
       localStorage.setItem(FAST_KEY, String(fastMode()))
+      localStorage.setItem(VOICE_PROVIDER_KEY, voiceProvider())
+      localStorage.setItem(SPEACHES_ENGLISH_KEY, String(speachesForceEnglish()))
+      localStorage.setItem(VOICE_AUTO_START_KEY, String(voiceAutoStart()))
       await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
       localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(sessionShortcuts()))
       if (history().length === 0) {
@@ -372,6 +678,11 @@ function PromptWindow() {
   }
 
   const globalKeys = (event: KeyboardEvent) => {
+    if (isVoiceInputShortcut(event) && !settingsOpen()) {
+      event.preventDefault()
+      toggleVoiceInput()
+      return
+    }
     if (event.key === 'Escape') {
       event.preventDefault()
       if (preview()) {
@@ -525,16 +836,32 @@ function PromptWindow() {
               rows={1}
               autofocus
             />
-            <button class="capture-button" classList={{ capturing: capturing() }} onClick={beginCapture} disabled={busy() || capturing()} title="Select another screen region" aria-label={capturing() ? 'Preparing screen capture' : 'Select screen region'}>
+            <button class="capture-button" classList={{ capturing: capturing() }} onClick={beginCapture} disabled={busy() || capturing() || voiceStatus() !== 'idle'} title="Select another screen region" aria-label={capturing() ? 'Preparing screen capture' : 'Select screen region'}>
               <Show when={!capturing()} fallback={<span class="capture-spinner" />}>
               <Camera size={20} />
               </Show>
             </button>
-            <button class="send-button" aria-label="Ask Hermes" onClick={submit} disabled={busy() || capturing() || (!prompt().trim() && captures().length === 0)}>
-              <Show when={!busy()} fallback={<span class="spinner" />}>
-                <ArrowRight size={20} />
-              </Show>
-            </button>
+            <Show
+              when={(!prompt().trim() && captures().length === 0) || voiceStatus() !== 'idle'}
+              fallback={
+                <button class="send-button" aria-label="Ask Hermes" onClick={submit} disabled={busy() || capturing()}>
+                  <Show when={!busy()} fallback={<span class="spinner" />}><ArrowRight size={20} /></Show>
+                </button>
+              }
+            >
+              <button
+                class="voice-button"
+                classList={{ recording: voiceStatus() === 'recording' }}
+                onClick={toggleVoiceInput}
+                disabled={busy() || capturing() || voiceStatus() === 'transcribing'}
+                title={voiceInputTooltip(voiceStatus(), voiceElapsed())}
+                aria-label={voiceInputTooltip(voiceStatus(), voiceElapsed())}
+              >
+                <Show when={voiceStatus() === 'idle'}><Mic size={20} /></Show>
+                <Show when={voiceStatus() === 'recording'}><Square size={15} /></Show>
+                <Show when={voiceStatus() === 'transcribing'}><span class="spinner" /></Show>
+              </button>
+            </Show>
           </div>
 
           <Show when={error()}><div class="error">{error()}</div></Show>
@@ -551,6 +878,7 @@ function PromptWindow() {
               <div class="settings-header"><span>Settings</span><button aria-label="Close settings" onClick={() => void invoke('hide_window')}><X size={16} /></button></div>
               <nav class="settings-tabs" aria-label="Settings sections">
                 <button classList={{ active: settingsTab() === 'general' }} onClick={() => setSettingsTab('general')}>General</button>
+                <button classList={{ active: settingsTab() === 'voice' }} onClick={() => setSettingsTab('voice')}>Voice input</button>
                 <button classList={{ active: settingsTab() === 'shortcuts' }} onClick={() => setSettingsTab('shortcuts')}>Session shortcuts</button>
               </nav>
               <div class="settings-body">
@@ -606,6 +934,38 @@ function PromptWindow() {
                       <input type="checkbox" checked={startAtLogin()} onChange={event => setStartAtLogin(event.currentTarget.checked)} />
                     </label>
                     <p>Model, thinking effort, and Fast mode apply only to sessions created by Ask Hermes.</p>
+                  </div>
+                </Show>
+                <Show when={settingsTab() === 'voice'}>
+                  <div class="settings-form">
+                    <label>
+                      Provider
+                      <span class="select-shell">
+                        <select value={voiceProvider()} onChange={event => setVoiceProvider(event.currentTarget.value as VoiceProvider)}>
+                          <option value="hermes">Hermes native</option>
+                          <option value="speaches" disabled={speachesStatus()?.installed === false}>Speaches realtime · local GPU</option>
+                        </select>
+                        <ChevronDown class="select-chevron" size={16} />
+                      </span>
+                    </label>
+                    <div class="voice-provider-note">
+                      <Show when={voiceProvider() === 'speaches'} fallback={<>Records the utterance, then transcribes it with the STT provider configured in Hermes.</>}>
+                        <Show when={speachesStatus()?.installed !== false} fallback={<>Native Speaches is not installed on this PC.</>}>
+                          Streams microphone audio to native Speaches with automatic end-of-speech detection and {speachesStatus()?.model || 'faster-whisper-large-v3-turbo'} on CUDA.
+                        </Show>
+                      </Show>
+                    </div>
+                    <Show when={voiceProvider() === 'speaches'}>
+                      <label class="settings-toggle">
+                        Force English
+                        <input type="checkbox" checked={speachesForceEnglish()} onChange={event => setSpeachesForceEnglish(event.currentTarget.checked)} />
+                      </label>
+                    </Show>
+                    <label class="settings-toggle">
+                      Start listening on open
+                      <input type="checkbox" checked={voiceAutoStart()} onChange={event => setVoiceAutoStart(event.currentTarget.checked)} />
+                    </label>
+                    <p>Press Ctrl+Shift+D while Ask Hermes is open to start or stop voice input.</p>
                   </div>
                 </Show>
                 <Show when={settingsTab() === 'shortcuts'}>
