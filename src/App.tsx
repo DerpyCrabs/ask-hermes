@@ -25,6 +25,7 @@ import { formatTurnActivity } from './turn-activity'
 import { shouldRememberPreviousChat } from './previous-chat'
 import { HermesRecording, HermesSilenceDetector, VoiceStartGate, blobToDataUrl, isVoiceInputShortcut, microphoneErrorMessage, normalizedVoiceLevel, preferredAudioMimeType, voiceInputTooltip, type VoiceInputStatus } from './voice-input'
 import { SpeachesRealtimeSession, speachesRealtimeUrl } from './speaches-realtime'
+import { buildHermesInstanceConfig } from './hermes-instance'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -44,6 +45,10 @@ const SESSION_SHORTCUTS_KEY = 'ask-hermes.session-shortcuts.v1'
 const VOICE_PROVIDER_KEY = 'ask-hermes.voice-provider'
 const SPEACHES_ENGLISH_KEY = 'ask-hermes.speaches-force-english'
 const VOICE_AUTO_START_KEY = 'ask-hermes.voice-auto-start'
+const HERMES_ADDRESS_KEY = 'ask-hermes.instance.address'
+const HERMES_PORT_KEY = 'ask-hermes.instance.port'
+const HERMES_REMOTE_KEY = 'ask-hermes.instance.remote'
+const HERMES_TOKEN_KEY = 'ask-hermes.instance.token'
 
 function storedSessionShortcuts(): SessionShortcut[] {
   try {
@@ -91,7 +96,7 @@ function PromptWindow() {
   const [turnActivities, setTurnActivities] = createSignal<Record<string, string>>({})
   const [capturing, setCapturing] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
-  const [settingsTab, setSettingsTab] = createSignal<'general' | 'voice' | 'shortcuts'>('general')
+  const [settingsTab, setSettingsTab] = createSignal<'general' | 'hermes' | 'voice' | 'shortcuts'>('general')
   const [model, setModel] = createSignal(localStorage.getItem(MODEL_KEY) || 'gpt-5.6-terra')
   const [effort, setEffort] = createSignal(localStorage.getItem(EFFORT_KEY) || 'low')
   const [fastMode, setFastMode] = createSignal(localStorage.getItem(FAST_KEY) === 'true')
@@ -115,6 +120,17 @@ function PromptWindow() {
   )
   const [voiceAutoStart, setVoiceAutoStart] = createSignal(
     localStorage.getItem(VOICE_AUTO_START_KEY) === 'true',
+  )
+  const [remoteHermes, setRemoteHermes] = createSignal(localStorage.getItem(HERMES_REMOTE_KEY) === 'true')
+  const [hermesAddress, setHermesAddress] = createSignal(localStorage.getItem(HERMES_ADDRESS_KEY) || '127.0.0.1')
+  const [hermesPort, setHermesPort] = createSignal(localStorage.getItem(HERMES_PORT_KEY) || '9119')
+  const [hermesToken, setHermesToken] = createSignal(localStorage.getItem(HERMES_TOKEN_KEY) || '')
+
+  const currentHermesInstance = () => buildHermesInstanceConfig(
+    remoteHermes(),
+    hermesAddress(),
+    hermesPort(),
+    hermesToken(),
   )
 
   const loadSessions = async () => {
@@ -443,6 +459,11 @@ function PromptWindow() {
   }
 
   onMount(() => {
+    try {
+      void invoke('configure_hermes_instance', { config: currentHermesInstance() }).catch(reason => setError(String(reason)))
+    } catch (reason) {
+      setError(String(reason))
+    }
     void loadSessions()
     void invoke<boolean>('hermes_desktop_available').then(setDesktopAvailable).catch(() => setDesktopAvailable(false))
     void invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() }).catch(reason => setError(String(reason)))
@@ -665,6 +686,12 @@ function PromptWindow() {
       localStorage.setItem(VOICE_PROVIDER_KEY, voiceProvider())
       localStorage.setItem(SPEACHES_ENGLISH_KEY, String(speachesForceEnglish()))
       localStorage.setItem(VOICE_AUTO_START_KEY, String(voiceAutoStart()))
+      const instance = currentHermesInstance()
+      await invoke('configure_hermes_instance', { config: instance })
+      localStorage.setItem(HERMES_REMOTE_KEY, String(remoteHermes()))
+      localStorage.setItem(HERMES_ADDRESS_KEY, hermesAddress().trim())
+      localStorage.setItem(HERMES_PORT_KEY, hermesPort().trim())
+      localStorage.setItem(HERMES_TOKEN_KEY, hermesToken().trim())
       await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
       localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(sessionShortcuts()))
       if (history().length === 0) {
@@ -878,6 +905,7 @@ function PromptWindow() {
               <div class="settings-header"><span>Settings</span><button aria-label="Close settings" onClick={() => void invoke('hide_window')}><X size={16} /></button></div>
               <nav class="settings-tabs" aria-label="Settings sections">
                 <button classList={{ active: settingsTab() === 'general' }} onClick={() => setSettingsTab('general')}>General</button>
+                <button classList={{ active: settingsTab() === 'hermes' }} onClick={() => setSettingsTab('hermes')}>Hermes</button>
                 <button classList={{ active: settingsTab() === 'voice' }} onClick={() => setSettingsTab('voice')}>Voice input</button>
                 <button classList={{ active: settingsTab() === 'shortcuts' }} onClick={() => setSettingsTab('shortcuts')}>Session shortcuts</button>
               </nav>
@@ -936,6 +964,34 @@ function PromptWindow() {
                     <p>Model, thinking effort, and Fast mode apply only to sessions created by Ask Hermes.</p>
                   </div>
                 </Show>
+                <Show when={settingsTab() === 'hermes'}>
+                  <div class="settings-form">
+                    <label>
+                      Connection
+                      <span class="select-shell">
+                        <select value={remoteHermes() ? 'remote' : 'local'} onChange={event => setRemoteHermes(event.currentTarget.value === 'remote')}>
+                          <option value="local">Automatic</option>
+                          <option value="remote">Existing instance</option>
+                        </select>
+                        <ChevronDown class="select-chevron" size={16} />
+                      </span>
+                    </label>
+                    <Show when={remoteHermes()}>
+                    <label>
+                      Address
+                      <input value={hermesAddress()} onInput={event => setHermesAddress(event.currentTarget.value)} placeholder="127.0.0.1" spellcheck={false} />
+                    </label>
+                    <label>
+                      Port
+                      <input value={hermesPort()} onInput={event => setHermesPort(event.currentTarget.value)} inputmode="numeric" placeholder="9119" />
+                    </label>
+                    <label>
+                      Session token
+                      <input type="password" value={hermesToken()} onInput={event => setHermesToken(event.currentTarget.value)} autocomplete="off" />
+                    </label>
+                    </Show>
+                  </div>
+                </Show>
                 <Show when={settingsTab() === 'voice'}>
                   <div class="settings-form">
                     <label>
@@ -943,18 +999,13 @@ function PromptWindow() {
                       <span class="select-shell">
                         <select value={voiceProvider()} onChange={event => setVoiceProvider(event.currentTarget.value as VoiceProvider)}>
                           <option value="hermes">Hermes native</option>
-                          <option value="speaches" disabled={speachesStatus()?.installed === false}>Speaches realtime · local GPU</option>
+                          <option value="speaches" disabled={speachesStatus()?.installed === false}>
+                            {speachesStatus()?.installed === false ? 'Speaches realtime · not installed' : 'Speaches realtime'}
+                          </option>
                         </select>
                         <ChevronDown class="select-chevron" size={16} />
                       </span>
                     </label>
-                    <div class="voice-provider-note">
-                      <Show when={voiceProvider() === 'speaches'} fallback={<>Records the utterance, then transcribes it with the STT provider configured in Hermes.</>}>
-                        <Show when={speachesStatus()?.installed !== false} fallback={<>Native Speaches is not installed on this PC.</>}>
-                          Streams microphone audio to native Speaches with automatic end-of-speech detection and {speachesStatus()?.model || 'faster-whisper-large-v3-turbo'} on CUDA.
-                        </Show>
-                      </Show>
-                    </div>
                     <Show when={voiceProvider() === 'speaches'}>
                       <label class="settings-toggle">
                         Force English
@@ -965,13 +1016,12 @@ function PromptWindow() {
                       Start listening on open
                       <input type="checkbox" checked={voiceAutoStart()} onChange={event => setVoiceAutoStart(event.currentTarget.checked)} />
                     </label>
-                    <p>Press Ctrl+Shift+D while Ask Hermes is open to start or stop voice input.</p>
                   </div>
                 </Show>
                 <Show when={settingsTab() === 'shortcuts'}>
                   <section class="shortcut-settings" aria-labelledby="shortcut-settings-title">
                     <div class="shortcut-settings-header">
-                      <div><h3 id="shortcut-settings-title">Open sessions directly</h3><span>Use a global hotkey or the tray menu</span></div>
+                      <h3 id="shortcut-settings-title">Open sessions directly</h3>
                       <button type="button" onClick={addSessionShortcut} disabled={sessions().length === 0}>Add shortcut</button>
                     </div>
                     <Show when={sessionShortcuts().length > 0} fallback={<div class="shortcut-empty">No session shortcuts configured.</div>}>

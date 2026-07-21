@@ -45,6 +45,13 @@ struct HermesGatewayConnection {
     token: String,
 }
 
+struct HermesBackendProcess {
+    child: Child,
+    connection: HermesGatewayConnection,
+    #[cfg(windows)]
+    _job: WindowsKillJob,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HermesSessionStarted {
     exchange_id: String,
@@ -109,19 +116,40 @@ struct SpeachesStatus {
     websocket_url: String,
 }
 
-struct HermesBackendProcess {
-    child: Child,
-    connection: HermesGatewayConnection,
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct HermesInstanceConfig {
+    remote: bool,
+    address: String,
+    port: u16,
+    token: String,
+}
+
+impl Default for HermesInstanceConfig {
+    fn default() -> Self {
+        Self {
+            remote: false,
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            token: String::new(),
+        }
+    }
 }
 
 #[derive(Default)]
-struct HermesBackend(Mutex<Option<HermesBackendProcess>>);
+struct HermesBackendState {
+    process: Option<HermesBackendProcess>,
+    config: HermesInstanceConfig,
+}
+
+#[derive(Default)]
+struct HermesBackend(Mutex<HermesBackendState>);
 
 impl Drop for HermesBackend {
     fn drop(&mut self) {
-        if let Ok(slot) = self.0.get_mut() {
-            if let Some(backend) = slot.as_mut() {
-                let _ = backend.child.kill();
+        if let Ok(state) = self.0.get_mut() {
+            if let Some(process) = state.process.as_mut() {
+                let _ = process.child.kill();
             }
         }
     }
@@ -276,24 +304,9 @@ fn hermes_binary() -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .or_else(|| {
-            which_on_path(if cfg!(windows) {
-                "hermes.exe"
-            } else {
-                "hermes"
-            })
-        })
         .ok_or_else(|| {
             "Hermes Agent was not found. Start Hermes Desktop once, then retry.".to_string()
         })
-}
-
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 fn desktop_binary() -> Result<PathBuf, String> {
@@ -448,11 +461,68 @@ fn get_session_history_page(
     query_history_page_from(&connection, &session_id, before_id, limit)
 }
 
+fn validate_hermes_address(config: &HermesInstanceConfig) -> Result<String, String> {
+    let address = config.address.trim();
+    if address.is_empty()
+        || address.contains("://")
+        || address
+            .chars()
+            .any(|character| character.is_whitespace() || "/\\@?#".contains(character))
+    {
+        return Err("Enter a valid Hermes hostname or IP address".to_string());
+    }
+    let unbracketed = address
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(address);
+    let formatted_host = if unbracketed.contains(':') {
+        format!("[{unbracketed}]")
+    } else {
+        unbracketed.to_string()
+    };
+    reqwest::Url::parse(&format!("http://{formatted_host}:1"))
+        .map_err(|_| "Enter a valid Hermes hostname or IP address".to_string())?;
+    Ok(unbracketed.to_string())
+}
+
+fn remote_hermes_connection(
+    config: &HermesInstanceConfig,
+) -> Result<HermesGatewayConnection, String> {
+    let address = validate_hermes_address(config)?;
+    if config.port == 0 {
+        return Err("Hermes port must be between 1 and 65535".to_string());
+    }
+    let token = config.token.trim();
+    if token.is_empty() {
+        return Err("Enter the Hermes session token".to_string());
+    }
+    let formatted_address = if address.contains(':') {
+        format!("[{address}]")
+    } else {
+        address
+    };
+    let mut http_url = reqwest::Url::parse(&format!("http://{formatted_address}:{}", config.port))
+        .map_err(|_| "Enter a valid Hermes hostname or IP address".to_string())?;
+    let mut ws_url = http_url.clone();
+    ws_url
+        .set_scheme("ws")
+        .map_err(|_| "Could not build the Hermes WebSocket address".to_string())?;
+    ws_url.set_path("/api/ws");
+    ws_url.query_pairs_mut().append_pair("token", token);
+    http_url.set_path("");
+    Ok(HermesGatewayConnection {
+        ws_url: ws_url.to_string(),
+        http_url: http_url.as_str().trim_end_matches('/').to_string(),
+        token: token.to_string(),
+    })
+}
+
 fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
+    let address = "127.0.0.1";
     let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let mut command = Command::new(hermes_binary()?);
     command
-        .args(["serve", "--host", "127.0.0.1", "--port", "0"])
+        .args(["serve", "--host", address, "--port", "0"])
         .env("HERMES_DASHBOARD_SESSION_TOKEN", &token)
         .env("HERMES_DESKTOP", "1")
         .stdin(Stdio::null())
@@ -464,18 +534,27 @@ fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        command.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
     }
 
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start the Hermes gateway: {error}"))?;
+    #[cfg(windows)]
+    let job = match assign_process_job_and_resume(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            return Err(error);
+        }
+    };
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "Hermes gateway did not expose its startup output".to_string())?;
     let mut reader = BufReader::new(stdout);
-    let port = loop {
+    let actual_port = loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) => {
@@ -511,31 +590,59 @@ fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
     Ok(HermesBackendProcess {
         child,
         connection: HermesGatewayConnection {
-            ws_url: format!("ws://127.0.0.1:{port}/api/ws?token={token}"),
-            http_url: format!("http://127.0.0.1:{port}"),
+            ws_url: format!("ws://127.0.0.1:{actual_port}/api/ws?token={token}"),
+            http_url: format!("http://127.0.0.1:{actual_port}"),
             token,
         },
+        #[cfg(windows)]
+        _job: job,
     })
 }
 
-fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConnection, String> {
-    let mut slot = state
+#[tauri::command]
+fn configure_hermes_instance(
+    config: HermesInstanceConfig,
+    state: tauri::State<'_, HermesBackend>,
+) -> Result<(), String> {
+    if config.remote {
+        remote_hermes_connection(&config)?;
+    }
+    let mut backend = state
         .0
         .lock()
         .map_err(|_| "Hermes gateway state is unavailable")?;
-    if let Some(backend) = slot.as_mut() {
-        if backend
+    if backend.config == config {
+        return Ok(());
+    }
+    if let Some(process) = backend.process.as_mut() {
+        let _ = process.child.kill();
+    }
+    backend.process = None;
+    backend.config = config;
+    Ok(())
+}
+
+fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConnection, String> {
+    let mut backend = state
+        .0
+        .lock()
+        .map_err(|_| "Hermes gateway state is unavailable")?;
+    if backend.config.remote {
+        return remote_hermes_connection(&backend.config);
+    }
+    if let Some(process) = backend.process.as_mut() {
+        if process
             .child
             .try_wait()
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            return Ok(backend.connection.clone());
+            return Ok(process.connection.clone());
         }
     }
-    let backend = start_hermes_backend()?;
-    let connection = backend.connection.clone();
-    *slot = Some(backend);
+    let process = start_hermes_backend()?;
+    let connection = process.connection.clone();
+    backend.process = Some(process);
     Ok(connection)
 }
 
@@ -672,7 +779,7 @@ async fn speaches_is_running() -> bool {
 }
 
 #[cfg(windows)]
-fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, String> {
+fn assign_process_job_and_resume(child: &Child) -> Result<WindowsKillJob, String> {
     use std::{mem::size_of, os::windows::io::AsRawHandle};
     use windows::{
         core::PCWSTR,
@@ -680,8 +787,8 @@ fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, Strin
             Foundation::{CloseHandle, HANDLE},
             System::{
                 Diagnostics::ToolHelp::{
-                    CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32,
-                    TH32CS_SNAPTHREAD,
+                    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                    THREADENTRY32,
                 },
                 JobObjects::{
                     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -694,7 +801,7 @@ fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, Strin
     };
 
     let job_handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-        .map_err(|error| format!("Could not create Speaches process job: {error}"))?;
+        .map_err(|error| format!("Could not create process job: {error}"))?;
     let job = WindowsKillJob(job_handle.0 as isize);
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -705,13 +812,13 @@ fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, Strin
             &limits as *const _ as *const _,
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         )
-        .map_err(|error| format!("Could not configure Speaches process job: {error}"))?;
+        .map_err(|error| format!("Could not configure process job: {error}"))?;
         AssignProcessToJobObject(job_handle, HANDLE(child.as_raw_handle()))
             .map_err(|error| format!("Could not assign Speaches to its process job: {error}"))?;
     }
 
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-        .map_err(|error| format!("Could not inspect the suspended Speaches process: {error}"))?;
+        .map_err(|error| format!("Could not inspect the suspended process: {error}"))?;
     let mut entry = THREADENTRY32 {
         dwSize: size_of::<THREADENTRY32>() as u32,
         ..Default::default()
@@ -729,9 +836,10 @@ fn assign_speaches_job_and_resume(child: &Child) -> Result<WindowsKillJob, Strin
         }
     }
     let _ = unsafe { CloseHandle(snapshot) };
-    let thread_id = thread_id.ok_or_else(|| "Could not find the suspended Speaches thread".to_string())?;
+    let thread_id =
+        thread_id.ok_or_else(|| "Could not find the suspended process thread".to_string())?;
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
-        .map_err(|error| format!("Could not open the suspended Speaches thread: {error}"))?;
+        .map_err(|error| format!("Could not open the suspended process thread: {error}"))?;
     let resume_result = unsafe { ResumeThread(thread) };
     let _ = unsafe { CloseHandle(thread) };
     if resume_result == u32::MAX {
@@ -798,7 +906,7 @@ fn spawn_speaches() -> Result<SpeachesProcess, String> {
         .spawn()
         .map_err(|error| format!("Could not start native Speaches: {error}"))?;
     #[cfg(windows)]
-    let job = match assign_speaches_job_and_resume(&child) {
+    let job = match assign_process_job_and_resume(&child) {
         Ok(job) => job,
         Err(error) => {
             let _ = child.kill();
@@ -1926,6 +2034,7 @@ pub fn run() {
             list_sessions,
             hermes_desktop_available,
             get_session_history_page,
+            configure_hermes_instance,
             set_session_shortcuts,
             get_voice_input_config,
             transcribe_voice_audio,
@@ -1961,7 +2070,7 @@ mod tests {
             .creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0)
             .spawn()
             .expect("test process should start suspended");
-        let job = assign_speaches_job_and_resume(&child).expect("test process should enter the job");
+        let job = assign_process_job_and_resume(&child).expect("test process should enter the job");
         assert!(child.try_wait().unwrap().is_none());
         drop(job);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1973,6 +2082,27 @@ mod tests {
         }
         let _ = child.kill();
         panic!("closing the job did not terminate its process");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn starts_and_reaches_the_hermes_gateway() {
+        use std::net::TcpStream;
+
+        if hermes_binary().is_err() {
+            return;
+        }
+        let backend =
+            start_hermes_backend().expect("Hermes gateway should announce its connection");
+        let url = reqwest::Url::parse(&backend.connection.http_url).unwrap();
+        let address = format!(
+            "{}:{}",
+            url.host_str().expect("gateway URL should contain a host"),
+            url.port().expect("gateway URL should contain a port")
+        );
+        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(2))
+            .expect("announced Hermes gateway should accept connections");
+        drop(backend);
     }
 
     fn session_db() -> Connection {
@@ -2071,6 +2201,49 @@ mod tests {
         assert!("Ctrl+Alt+H".parse::<Shortcut>().is_ok());
         assert!("Ctrl+Shift+D".parse::<Shortcut>().is_ok());
         assert!("Shift+F8".parse::<Shortcut>().is_ok());
+    }
+
+    #[test]
+    fn accepts_existing_hermes_instance_addresses() {
+        assert_eq!(
+            validate_hermes_address(&HermesInstanceConfig {
+                remote: true,
+                address: "::1".to_string(),
+                port: 9119,
+                token: "secret".to_string(),
+            })
+            .unwrap(),
+            "::1"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_existing_hermes_instance_addresses() {
+        let invalid_host = HermesInstanceConfig {
+            remote: true,
+            address: "http://hermes.lan".to_string(),
+            port: 9119,
+            token: "secret".to_string(),
+        };
+        assert!(validate_hermes_address(&invalid_host)
+            .unwrap_err()
+            .contains("hostname"));
+    }
+
+    #[test]
+    fn builds_authenticated_existing_hermes_connection() {
+        let connection = remote_hermes_connection(&HermesInstanceConfig {
+            remote: true,
+            address: "127.0.0.1".to_string(),
+            port: 9119,
+            token: "a/b c".to_string(),
+        })
+        .unwrap();
+        assert_eq!(connection.http_url, "http://127.0.0.1:9119");
+        assert_eq!(
+            connection.ws_url,
+            "ws://127.0.0.1:9119/api/ws?token=a%2Fb+c"
+        );
     }
 
     #[test]
