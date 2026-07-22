@@ -20,9 +20,9 @@ describe('Hermes instance configuration', () => {
     })
   })
 
-  it('rejects incomplete remote configuration', () => {
+  it('rejects invalid remote endpoints and allows no token', () => {
     expect(() => buildHermesInstanceConfig(true, 'http://host', '9119', 'secret')).toThrow('hostname')
     expect(() => buildHermesInstanceConfig(true, 'host', '0', 'secret')).toThrow('port')
-    expect(() => buildHermesInstanceConfig(true, 'host', '9119', '')).toThrow('session token')
+    expect(buildHermesInstanceConfig(true, 'host', '9119', '').token).toBe('')
   })
 })

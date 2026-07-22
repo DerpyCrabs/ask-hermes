@@ -171,6 +171,7 @@ button { color: inherit; }
 .settings-toggle input { width: 18px; height: 18px; margin: 0; accent-color: #0053fd; cursor: pointer; }
 .settings-panel p { margin: 18px 0 4px; color: #7b8190; font-size: 11px; }
 .settings-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; padding-top: 10px; border-top: 1px solid rgba(0,83,253,.08); }
+.settings-error { flex: 0 0 auto; margin: 4px 0 2px; color: #c51f42; font-size: 11px; }
 .settings-save { height: 34px; padding: 0 18px; border: 0; border-radius: 9px; background: #0053fd; color: white; cursor: pointer; }
 .shortcut-settings { padding: 6px 4px; }
 .shortcut-settings-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }

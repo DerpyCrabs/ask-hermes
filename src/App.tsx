@@ -108,6 +108,7 @@ function PromptWindow() {
   const [loadingOlderMessages, setLoadingOlderMessages] = createSignal(false)
   const [loadingSessionHistory, setLoadingSessionHistory] = createSignal(false)
   const [error, setError] = createSignal('')
+  const [settingsError, setSettingsError] = createSignal('')
   const [desktopAvailable, setDesktopAvailable] = createSignal(false)
   const [voiceStatus, setVoiceStatus] = createSignal<VoiceInputStatus>('idle')
   const [voiceElapsed, setVoiceElapsed] = createSignal(0)
@@ -547,6 +548,7 @@ function PromptWindow() {
     const unlistenCaptureReady = listen('selection-ready', () => setCapturing(false))
     const unlistenSettings = listen('open-settings', () => {
       setSettingsTab('general')
+      setSettingsError('')
       setSettingsOpen(true)
       void loadSessions()
       void isAutostartEnabled().then(setStartAtLogin).catch(reason => setError(String(reason)))
@@ -674,6 +676,7 @@ function PromptWindow() {
   }
 
   const applySettings = async () => {
+    setSettingsError('')
     try {
       const currentAutostart = await isAutostartEnabled()
       const action = autostartAction(currentAutostart, startAtLogin())
@@ -700,7 +703,7 @@ function PromptWindow() {
       }
       await invoke('hide_window')
     } catch (reason) {
-      setError(String(reason))
+      setSettingsError(String(reason))
     }
   }
 
@@ -986,7 +989,7 @@ function PromptWindow() {
                       <input value={hermesPort()} onInput={event => setHermesPort(event.currentTarget.value)} inputmode="numeric" placeholder="9119" />
                     </label>
                     <label>
-                      Session token
+                      Session token (optional)
                       <input type="password" value={hermesToken()} onInput={event => setHermesToken(event.currentTarget.value)} autocomplete="off" />
                     </label>
                     </Show>
@@ -1041,6 +1044,7 @@ function PromptWindow() {
                   </section>
                 </Show>
               </div>
+              <Show when={settingsError()}><div class="settings-error" role="alert">{settingsError()}</div></Show>
               <footer class="settings-footer"><button class="settings-save" onClick={applySettings}>Apply</button></footer>
             </div>
           </Show>

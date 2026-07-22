@@ -116,7 +116,7 @@ struct SpeachesStatus {
     websocket_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct HermesInstanceConfig {
     remote: bool,
@@ -493,9 +493,6 @@ fn remote_hermes_connection(
         return Err("Hermes port must be between 1 and 65535".to_string());
     }
     let token = config.token.trim();
-    if token.is_empty() {
-        return Err("Enter the Hermes session token".to_string());
-    }
     let formatted_address = if address.contains(':') {
         format!("[{address}]")
     } else {
@@ -508,7 +505,9 @@ fn remote_hermes_connection(
         .set_scheme("ws")
         .map_err(|_| "Could not build the Hermes WebSocket address".to_string())?;
     ws_url.set_path("/api/ws");
-    ws_url.query_pairs_mut().append_pair("token", token);
+    if !token.is_empty() {
+        ws_url.query_pairs_mut().append_pair("token", token);
+    }
     http_url.set_path("");
     Ok(HermesGatewayConnection {
         ws_url: ws_url.to_string(),
@@ -662,9 +661,10 @@ async fn hermes_http_json(
         .timeout(timeout)
         .build()
         .map_err(|error| format!("Could not prepare Hermes request: {error}"))?;
-    let mut request = client
-        .request(method, format!("{}{}", connection.http_url, path))
-        .header("X-Hermes-Session-Token", &connection.token);
+    let mut request = client.request(method, format!("{}{}", connection.http_url, path));
+    if !connection.token.is_empty() {
+        request = request.header("X-Hermes-Session-Token", &connection.token);
+    }
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -2244,6 +2244,19 @@ mod tests {
             connection.ws_url,
             "ws://127.0.0.1:9119/api/ws?token=a%2Fb+c"
         );
+    }
+
+    #[test]
+    fn builds_tokenless_existing_hermes_connection() {
+        let connection = remote_hermes_connection(&HermesInstanceConfig {
+            remote: true,
+            address: "127.0.0.1".to_string(),
+            port: 9119,
+            token: String::new(),
+        })
+        .unwrap();
+        assert_eq!(connection.ws_url, "ws://127.0.0.1:9119/api/ws");
+        assert!(connection.token.is_empty());
     }
 
     #[test]

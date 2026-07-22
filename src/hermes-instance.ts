@@ -22,7 +22,6 @@ export function buildHermesInstanceConfig(
     throw new Error('Hermes port must be between 1 and 65535')
   }
   const normalizedToken = token.trim()
-  if (!normalizedToken) throw new Error('Enter the Hermes session token')
 
   return {
     remote: true,
