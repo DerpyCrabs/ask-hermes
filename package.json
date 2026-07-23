@@ -6,13 +6,16 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:release": "tauri build --no-bundle",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:startup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-startup.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-autostart": "^2.5.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "lucide-solid": "^1.25.0",
     "marked": "^18.0.7",
     "solid-js": "^1.9.14"

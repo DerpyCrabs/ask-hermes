@@ -10,8 +10,9 @@ describe('renderMarkdown', () => {
   })
 
   it('does not execute raw HTML or javascript links', () => {
-    const html = renderMarkdown('<script>alert(1)</script> [bad](javascript:alert(1))')
+    const html = renderMarkdown('<script>alert(1)</script> [bad](javascript:alert(1)) ![bad](javascript:alert(2))')
     expect(html).not.toContain('<script>')
     expect(html).not.toContain('href="javascript:')
+    expect(html).not.toContain('src="javascript:')
   })
 })

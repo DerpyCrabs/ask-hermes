@@ -39,6 +39,22 @@
         "visible": false,
         "skipTaskbar": true,
         "shadow": false
+      },
+      {
+        "label": "workspace",
+        "title": "Ask Hermes Workspace",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 820,
+        "minHeight": 560,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "resizable": true,
+        "visible": false,
+        "skipTaskbar": false,
+        "shadow": true
       }
     ],
     "security": { "csp": null }

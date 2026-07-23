@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event'
 import type { TurnActivityKind } from './turn-activity'
 
 type TurnOptions = {
+  instanceId: string
+  instanceGeneration: number
   exchangeId: string
   prompt: string
   images: string[]
@@ -49,6 +51,8 @@ export async function runHermesTurn(options: TurnOptions) {
   try {
     const result = await invoke<TurnResult>('ask_hermes_gateway', {
       request: {
+        instanceId: options.instanceId,
+        instanceGeneration: options.instanceGeneration,
         exchangeId: options.exchangeId,
         prompt: options.prompt,
         imageDataUrls: options.images,

@@ -4,13 +4,13 @@ A lightweight Windows tray app for asking your local Hermes agent from anywhere.
 
 ![Ask Hermes prompt with a screen capture](docs/prompt-with-capture.png)
 
-Press **Alt+Space**, type a question, paste an image, or capture one or more screen regions. Answers appear in the same window with Markdown support.
+Press the configurable global shortcut (**Alt+Space** by default), type a question, paste an image, or capture one or more screen regions. Answers appear in the same window with Markdown support.
 
 ![Ask Hermes answer window](docs/answer-window.png)
 
 ## Features
 
-- Global **Alt+Space** prompt and persistent tray process
+- Configurable global prompt shortcut (**Alt+Space** by default) and persistent tray process
 - Restore the previous in-window chat from the tray
 - Assign global hotkeys and tray entries to specific Hermes sessions
 - New or existing Hermes sessions

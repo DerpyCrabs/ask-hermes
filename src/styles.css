@@ -142,6 +142,7 @@ button { color: inherit; }
 .attachments { max-width: 172px; height: 49px; flex: 0 1 auto; display: flex; gap: 6px; padding: 7px 7px 2px 2px; overflow-x: auto; overflow-y: hidden; }
 .attachments::-webkit-scrollbar { height: 3px; }
 .attachments::-webkit-scrollbar-thumb { background: rgba(0,83,253,.2); border-radius: 4px; }
+.compact-queue-status { flex: 0 0 auto; padding: 5px 7px; border: 0; border-radius: 8px; background: rgba(0,83,253,.08); color: #0053fd; font-size: 10px; cursor: pointer; }
 .attachment { position: relative; width: 42px; height: 40px; flex: 0 0 auto; }
 .attachment-preview { width: 42px; height: 40px; padding: 0; overflow: hidden; border: 1px solid rgba(0,83,253,.22); border-radius: 9px; background: #eef3ff; cursor: zoom-in; }
 .attachment-preview img { width: 100%; height: 100%; display: block; object-fit: cover; }
@@ -170,6 +171,10 @@ button { color: inherit; }
 .settings-toggle { min-height: 24px; margin-top: 6px !important; margin-bottom: 6px !important; }
 .settings-toggle input { width: 18px; height: 18px; margin: 0; accent-color: #0053fd; cursor: pointer; }
 .settings-panel p { margin: 18px 0 4px; color: #7b8190; font-size: 11px; }
+.instance-actions { display: flex; justify-content: flex-end; gap: 8px; margin: -2px 0 4px; }
+.instance-actions button { min-height: 30px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: #fff; color: #303642; font-size: 11px; cursor: pointer; }
+.instance-actions button:hover:not(:disabled) { border-color: rgba(0,83,253,.4); background: rgba(0,83,253,.035); }
+.instance-actions button:disabled { opacity: .4; cursor: default; }
 .settings-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; padding-top: 10px; border-top: 1px solid rgba(0,83,253,.08); }
 .settings-error { flex: 0 0 auto; margin: 4px 0 2px; color: #c51f42; font-size: 11px; }
 .settings-save { height: 34px; padding: 0 18px; border: 0; border-radius: 9px; background: #0053fd; color: white; cursor: pointer; }
@@ -179,6 +184,16 @@ button { color: inherit; }
 .shortcut-settings-header button { height: 30px; padding: 0 11px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: rgba(0,83,253,.06); color: #0053fd; font-size: 11px; cursor: pointer; }
 .shortcut-settings-header button:disabled { opacity: .4; cursor: default; }
 .shortcut-empty { margin-top: 18px; padding: 30px 16px; border: 1px dashed rgba(0,83,253,.18); border-radius: 12px; color: #8a8f9d; text-align: center; font-size: 11px; }
+.prompt-shortcut-settings { padding-bottom: 17px; border-bottom: 1px solid rgba(0,83,253,.1); }
+.prompt-shortcut-settings .shortcut-settings-header { margin-bottom: 12px; }
+.prompt-shortcut-settings .shortcut-settings-header p { margin: 3px 0 0; }
+.session-shortcut-settings { padding-top: 18px; }
+.prompt-shortcut-row { display: grid; grid-template-columns: 128px minmax(0,1fr) auto; align-items: center; gap: 9px; color: #666678; font-size: 12px; }
+.prompt-shortcut-row label { display: block; margin: 0; }
+.prompt-shortcut-row input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid rgba(0,83,253,.16); border-radius: 8px; outline: 0; background: #fff; color: #363640; font-size: 11px; text-align: center; cursor: pointer; box-sizing: border-box; }
+.prompt-shortcut-row input:focus { border-color: rgba(0,83,253,.55); box-shadow: 0 0 0 2px rgba(0,83,253,.07); }
+.prompt-shortcut-row button { height: 30px; padding: 0 11px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: rgba(0,83,253,.06); color: #0053fd; font-size: 11px; cursor: pointer; }
+.prompt-shortcut-row button:disabled { opacity: .4; cursor: default; }
 .shortcut-row { display: grid; grid-template-columns: 128px minmax(0,1fr) 28px; align-items: center; gap: 9px; margin-top: 10px; }
 .shortcut-row input, .shortcut-row select { width: 100%; height: 34px; padding: 0 30px 0 9px; border: 1px solid rgba(0,83,253,.16); border-radius: 8px; outline: 0; background: #fff; color: #363640; font-size: 11px; }
 .shortcut-row input { padding: 0 9px; text-align: center; cursor: pointer; }

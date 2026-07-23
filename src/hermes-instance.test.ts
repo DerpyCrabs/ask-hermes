@@ -8,6 +8,8 @@ describe('Hermes instance configuration', () => {
       address: '127.0.0.1',
       port: 0,
       token: '',
+      instanceId: 'automatic-hermes',
+      instanceName: 'Automatic Hermes',
     })
   })
 
@@ -17,6 +19,15 @@ describe('Hermes instance configuration', () => {
       address: 'hermes.lan',
       port: 9119,
       token: 'secret',
+      instanceId: 'existing:hermes.lan:9119',
+      instanceName: 'Existing Hermes instance',
+    })
+  })
+
+  it('preserves the saved connection identity for scoped workspace state', () => {
+    expect(buildHermesInstanceConfig(true, 'host', '9119', '', 'derp-local', 'Local derp-agent')).toMatchObject({
+      instanceId: 'derp-local',
+      instanceName: 'Local derp-agent',
     })
   })
 

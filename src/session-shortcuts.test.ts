@@ -5,6 +5,10 @@ describe('session shortcuts', () => {
   it('formats modified keys for the native shortcut parser', () => {
     expect(shortcutFromKeyboardEvent({ key: 'h', ctrlKey: true, altKey: true, shiftKey: false, metaKey: false })).toBe('Ctrl+Alt+H')
     expect(shortcutFromKeyboardEvent({ key: 'F8', ctrlKey: false, altKey: false, shiftKey: true, metaKey: false })).toBe('Shift+F8')
+    expect(shortcutFromKeyboardEvent({ key: ' ', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false })).toBe('Alt+Space')
+    expect(shortcutFromKeyboardEvent({ key: 'k', ctrlKey: false, altKey: false, shiftKey: false, metaKey: true })).toBe('Super+K')
+    expect(shortcutFromKeyboardEvent({ key: '!', code: 'Digit1', ctrlKey: true, altKey: false, shiftKey: true, metaKey: false })).toBe('Ctrl+Shift+1')
+    expect(shortcutFromKeyboardEvent({ key: 'layout-dependent', code: 'KeyA', ctrlKey: true, altKey: false, shiftKey: false, metaKey: false })).toBe('Ctrl+A')
   })
 
   it('rejects bare keys and modifier-only input', () => {
