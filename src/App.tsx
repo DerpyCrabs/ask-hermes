@@ -47,6 +47,7 @@ import {
   writeWorkspaceNotificationPreferences,
 } from './workspace/notifications'
 import { workspaceText as workspaceCopy } from './workspace/strings'
+import { savePersistentSettings, settingsFromStorage } from './settings-config'
 import {
   handoffResultMatchesPending,
   handoffPayloadMatches,
@@ -1565,6 +1566,34 @@ function PromptWindow() {
         shortcuts: nextSessionShortcuts,
       })
 
+      const notificationPreferences = {
+        turnCompletion: notifyTurnCompletion(),
+        interactionRequired: notifyInteractionRequired(),
+        scheduleFailure: notifyScheduleFailure(),
+        scheduleCompletion: notifyScheduleCompletion(),
+      }
+      const persistent = settingsFromStorage(localStorage)
+      Object.assign(persistent.values, {
+        [MODEL_KEY]: model(),
+        [EFFORT_KEY]: effort(),
+        [FAST_KEY]: String(fastMode()),
+        [VOICE_PROVIDER_KEY]: voiceProvider(),
+        [SPEACHES_ENGLISH_KEY]: String(speachesForceEnglish()),
+        [VOICE_AUTO_START_KEY]: String(voiceAutoStart()),
+        [INSTANCES_KEY]: JSON.stringify(nextInstances),
+        [ACTIVE_INSTANCE_KEY]: activeInstanceId(),
+        [HERMES_REMOTE_KEY]: String(remoteHermes()),
+        [HERMES_ADDRESS_KEY]: hermesAddress().trim(),
+        [HERMES_PORT_KEY]: hermesPort().trim(),
+        [HERMES_TOKEN_KEY]: hermesToken().trim(),
+        [TRAY_LINK_MODE_KEY]: nextTrayMode,
+        [PROMPT_SHORTCUT_KEY]: nextPromptShortcut,
+        [SESSION_SHORTCUTS_KEY]: JSON.stringify(nextSessionShortcuts),
+        [SESSION_PREFERENCE_KEY]: sessionPreference(),
+        ['ask-hermes.workspace-notifications.v1']: JSON.stringify(notificationPreferences),
+      })
+      await savePersistentSettings(persistent)
+
       // Commit browser persistence only after every fallible native setting
       // mutation succeeds. Failed Apply must not leave a half-saved form.
       setSavedInstances(nextInstances)
@@ -1581,12 +1610,7 @@ function PromptWindow() {
       localStorage.setItem(HERMES_PORT_KEY, hermesPort().trim())
       localStorage.setItem(HERMES_TOKEN_KEY, hermesToken().trim())
       localStorage.setItem(TRAY_LINK_MODE_KEY, nextTrayMode)
-      writeWorkspaceNotificationPreferences({
-        turnCompletion: notifyTurnCompletion(),
-        interactionRequired: notifyInteractionRequired(),
-        scheduleFailure: notifyScheduleFailure(),
-        scheduleCompletion: notifyScheduleCompletion(),
-      })
+      writeWorkspaceNotificationPreferences(notificationPreferences)
       await emit('workspace-notification-preferences-changed')
       localStorage.setItem(PROMPT_SHORTCUT_KEY, nextPromptShortcut)
       localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(nextSessionShortcuts))

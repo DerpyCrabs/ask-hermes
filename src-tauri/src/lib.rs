@@ -11,7 +11,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Cursor, Read, Write},
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
@@ -278,6 +278,8 @@ const DEFAULT_PROMPT_SHORTCUT: &str = "Alt+Space";
 #[cfg(windows)]
 const TRAY_ICON_ID: &str = "ask-hermes-tray";
 const PROMPT_SHORTCUT_CONFIG_FILE: &str = "prompt-shortcut.json";
+const SETTINGS_CONFIG_FILE: &str = "settings.json";
+const SETTINGS_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ActiveShortcutConfiguration {
@@ -312,6 +314,30 @@ struct ShortcutUpdateState(tokio::sync::Mutex<()>);
 struct PersistedPromptShortcut {
     version: u8,
     shortcut: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct PersistedSettings {
+    version: u8,
+    values: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedSettings {
+    settings: Option<PersistedSettings>,
+    migrate_local_storage: bool,
+}
+
+struct SettingsConfigOverride(Result<Option<PathBuf>, String>);
+
+#[derive(Default)]
+struct SettingsConfigWriteState(Mutex<()>);
+
+impl Default for SettingsConfigOverride {
+    fn default() -> Self {
+        Self(Ok(None))
+    }
 }
 
 #[derive(Default)]
@@ -2225,6 +2251,176 @@ fn save_persisted_prompt_shortcut(app: &AppHandle, shortcut: &str) -> Result<(),
     fs::write(path, encoded).map_err(|error| format!("Could not save prompt shortcut: {error}"))
 }
 
+fn parse_settings_config_override(args: &[std::ffi::OsString]) -> Result<Option<PathBuf>, String> {
+    let mut configured = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].to_string_lossy();
+        let value = if argument == "--config" {
+            index += 1;
+            args.get(index)
+                .map(PathBuf::from)
+                .ok_or_else(|| "--config requires a file path".to_string())?
+        } else if let Some(value) = argument.strip_prefix("--config=") {
+            if value.is_empty() {
+                return Err("--config requires a file path".to_string());
+            }
+            PathBuf::from(value)
+        } else {
+            index += 1;
+            continue;
+        };
+        if configured.is_some() {
+            return Err("--config may only be specified once".to_string());
+        }
+        configured = Some(if value.is_absolute() {
+            value
+        } else {
+            env::current_dir()
+                .map_err(|error| format!("Could not resolve --config path: {error}"))?
+                .join(value)
+        });
+        index += 1;
+    }
+    Ok(configured)
+}
+
+fn settings_config_path(
+    app: &AppHandle,
+    configured: &SettingsConfigOverride,
+) -> Result<PathBuf, String> {
+    match &configured.0 {
+        Ok(Some(path)) => Ok(path.clone()),
+        Ok(None) => app
+            .path()
+            .app_config_dir()
+            .map(|directory| directory.join(SETTINGS_CONFIG_FILE))
+            .map_err(|error| format!("Could not locate app configuration: {error}")),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn load_settings_from_path(path: &Path) -> Result<Option<PersistedSettings>, String> {
+    let backup = path.with_extension("backup");
+    let source = if path.exists() {
+        path
+    } else {
+        backup.as_path()
+    };
+    let metadata = match fs::metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not inspect settings: {error}")),
+    };
+    if metadata.len() > SETTINGS_CONFIG_MAX_BYTES {
+        return Err(format!(
+            "Settings file exceeds {} bytes",
+            SETTINGS_CONFIG_MAX_BYTES
+        ));
+    }
+    let contents =
+        fs::read_to_string(source).map_err(|error| format!("Could not read settings: {error}"))?;
+    let settings = serde_json::from_str::<PersistedSettings>(&contents)
+        .map_err(|error| format!("Could not parse settings: {error}"))?;
+    if settings.version != 1 {
+        return Err(format!("Unsupported settings version {}", settings.version));
+    }
+    Ok(Some(settings))
+}
+
+fn validate_settings(settings: &PersistedSettings) -> Result<(), String> {
+    if settings.version != 1 {
+        return Err(format!("Unsupported settings version {}", settings.version));
+    }
+    if settings.values.len() > 128 {
+        return Err("Settings file contains too many entries".to_string());
+    }
+    for (key, value) in &settings.values {
+        if !key.starts_with("ask-hermes.") || key.len() > 256 {
+            return Err(format!("Invalid settings key {key}"));
+        }
+        if value.len() > 256 * 1024 {
+            return Err(format!("Settings value for {key} is too large"));
+        }
+    }
+    Ok(())
+}
+
+fn save_settings_to_path(path: &Path, settings: &PersistedSettings) -> Result<(), String> {
+    validate_settings(settings)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Settings path must include a parent directory".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create app configuration: {error}"))?;
+    let encoded = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("Could not encode settings: {error}"))?;
+    if encoded.len() as u64 > SETTINGS_CONFIG_MAX_BYTES {
+        return Err(format!(
+            "Settings file exceeds {} bytes",
+            SETTINGS_CONFIG_MAX_BYTES
+        ));
+    }
+
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let backup = path.with_extension("backup");
+    {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("Could not create temporary settings: {error}"))?;
+        file.write_all(&encoded)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("Could not write temporary settings: {error}"))?;
+    }
+
+    if path.exists() {
+        let _ = fs::remove_file(&backup);
+        fs::rename(path, &backup)
+            .map_err(|error| format!("Could not prepare settings replacement: {error}"))?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        return Err(format!("Could not replace settings: {error}"));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+#[tauri::command]
+fn load_settings(
+    app: AppHandle,
+    configured: tauri::State<'_, SettingsConfigOverride>,
+) -> Result<LoadedSettings, String> {
+    let migrate_local_storage = matches!(&configured.0, Ok(None));
+    Ok(LoadedSettings {
+        settings: load_settings_from_path(&settings_config_path(&app, &configured)?)?,
+        migrate_local_storage,
+    })
+}
+
+#[tauri::command]
+fn save_settings(
+    app: AppHandle,
+    settings: PersistedSettings,
+    configured: tauri::State<'_, SettingsConfigOverride>,
+    writes: tauri::State<'_, SettingsConfigWriteState>,
+) -> Result<(), String> {
+    let _write = writes
+        .0
+        .lock()
+        .map_err(|_| "Settings writer is unavailable".to_string())?;
+    save_settings_to_path(&settings_config_path(&app, &configured)?, &settings)
+}
+
 fn validate_shortcut_configuration(
     prompt_shortcut: &str,
     shortcuts: &[SessionShortcutConfig],
@@ -2403,6 +2599,7 @@ async fn set_shortcuts(
     state: tauri::State<'_, ShortcutConfigurationState>,
     updates: tauri::State<'_, ShortcutUpdateState>,
     backend: tauri::State<'_, HermesBackend>,
+    settings_config: tauri::State<'_, SettingsConfigOverride>,
 ) -> Result<(), String> {
     let next = validate_shortcut_configuration(&prompt_shortcut, &shortcuts)?;
     let _update = updates.0.lock().await;
@@ -2415,7 +2612,12 @@ async fn set_shortcuts(
     let applied_prompt = next.prompt_shortcut.clone();
     let applied_sessions = next.session_shortcuts.clone();
     replace_registered_shortcuts(&app, &mut applied, next)?;
-    if let Err(error) = save_persisted_prompt_shortcut(&app, &applied_prompt) {
+    let prompt_persistence = if matches!(&settings_config.0, Ok(None)) {
+        save_persisted_prompt_shortcut(&app, &applied_prompt)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = prompt_persistence {
         let shortcut_rollback =
             replace_registered_shortcuts(&app, &mut applied, previous.clone()).err();
         let persistence_rollback =
@@ -3324,6 +3526,8 @@ fn tray_icon() -> Image<'static> {
 }
 
 pub fn run() {
+    let command_line = env::args_os().skip(1).collect::<Vec<_>>();
+    let settings_config = SettingsConfigOverride(parse_settings_config_override(&command_line));
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(
@@ -3374,6 +3578,8 @@ pub fn run() {
         .manage(SettingsWindowState::default())
         .manage(ActiveSessionShortcut::default())
         .manage(PromptWindowLayout::default())
+        .manage(settings_config)
+        .manage(SettingsConfigWriteState::default())
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
@@ -3433,9 +3639,23 @@ pub fn run() {
                 None,
             ))?;
 
-            let persisted_prompt_shortcut = load_persisted_prompt_shortcut(app.handle())
+            let settings_config = app.state::<SettingsConfigOverride>();
+            let central_prompt_shortcut = settings_config_path(app.handle(), &settings_config)
                 .ok()
-                .flatten()
+                .and_then(|path| load_settings_from_path(&path).ok().flatten())
+                .and_then(|settings| {
+                    settings
+                        .values
+                        .get("ask-hermes.prompt-shortcut.v1")
+                        .cloned()
+                });
+            let legacy_prompt_shortcut = if matches!(&settings_config.0, Ok(None)) {
+                load_persisted_prompt_shortcut(app.handle()).ok().flatten()
+            } else {
+                None
+            };
+            let persisted_prompt_shortcut = central_prompt_shortcut
+                .or(legacy_prompt_shortcut)
                 .unwrap_or_else(|| DEFAULT_PROMPT_SHORTCUT.to_string());
             let mut initial_shortcuts =
                 validate_shortcut_configuration(&persisted_prompt_shortcut, &[])
@@ -3616,6 +3836,8 @@ pub fn run() {
             get_session_history_page,
             get_hermes_instance_scope,
             configure_hermes_instance,
+            load_settings,
+            save_settings,
             set_shortcuts,
             get_voice_input_config,
             transcribe_voice_audio,
@@ -3683,6 +3905,79 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_settings_path(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir()
+            .join(format!(
+                "ask-hermes-settings-test-{}-{unique}",
+                std::process::id()
+            ))
+            .join(format!("{label}.json"))
+    }
+
+    #[test]
+    fn parses_both_settings_config_argument_forms() {
+        let separated =
+            parse_settings_config_override(&["--config".into(), "profiles/work.json".into()])
+                .unwrap()
+                .unwrap();
+        let joined = parse_settings_config_override(&["--config=profiles/work.json".into()])
+            .unwrap()
+            .unwrap();
+        assert!(separated.is_absolute());
+        assert_eq!(separated, joined);
+        assert!(parse_settings_config_override(&["--config".into()]).is_err());
+    }
+
+    #[test]
+    fn settings_file_round_trips_and_replaces_previous_values() {
+        let path = temporary_settings_path("round-trip");
+        let first = PersistedSettings {
+            version: 1,
+            values: HashMap::from([("ask-hermes.model".to_string(), "first".to_string())]),
+        };
+        save_settings_to_path(&path, &first).unwrap();
+        assert_eq!(load_settings_from_path(&path).unwrap(), Some(first));
+
+        let second = PersistedSettings {
+            version: 1,
+            values: HashMap::from([("ask-hermes.model".to_string(), "second".to_string())]),
+        };
+        save_settings_to_path(&path, &second).unwrap();
+        assert_eq!(load_settings_from_path(&path).unwrap(), Some(second));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn settings_file_rejects_unknown_versions_and_keys() {
+        let invalid_version = PersistedSettings {
+            version: 2,
+            values: HashMap::new(),
+        };
+        assert!(validate_settings(&invalid_version).is_err());
+        let invalid_key = PersistedSettings {
+            version: 1,
+            values: HashMap::from([("other-app.model".to_string(), "value".to_string())]),
+        };
+        assert!(validate_settings(&invalid_key).is_err());
+    }
+
+    #[test]
+    fn settings_file_recovers_interrupted_replacement_from_backup() {
+        let path = temporary_settings_path("backup-recovery");
+        let settings = PersistedSettings {
+            version: 1,
+            values: HashMap::from([("ask-hermes.model".to_string(), "saved".to_string())]),
+        };
+        save_settings_to_path(&path, &settings).unwrap();
+        fs::rename(&path, path.with_extension("backup")).unwrap();
+        assert_eq!(load_settings_from_path(&path).unwrap(), Some(settings));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
