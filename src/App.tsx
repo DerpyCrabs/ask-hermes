@@ -26,6 +26,7 @@ import { shouldRememberPreviousChat } from './previous-chat'
 import { HermesRecording, HermesSilenceDetector, VoiceStartGate, blobToDataUrl, isVoiceInputShortcut, microphoneErrorMessage, normalizedVoiceLevel, preferredAudioMimeType, voiceInputTooltip, type VoiceInputStatus } from './voice-input'
 import { SpeachesRealtimeSession, speachesRealtimeUrl } from './speaches-realtime'
 import { buildHermesInstanceConfig } from './hermes-instance'
+import { savePersistentSettings, settingsFromStorage } from './settings-config'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -682,6 +683,25 @@ function PromptWindow() {
       const action = autostartAction(currentAutostart, startAtLogin())
       if (action === 'enable') await enableAutostart()
       if (action === 'disable') await disableAutostart()
+      const instance = currentHermesInstance()
+      await invoke('configure_hermes_instance', { config: instance })
+      await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
+      const persistent = settingsFromStorage(localStorage)
+      Object.assign(persistent.values, {
+        [SESSION_PREFERENCE_KEY]: sessionPreference(),
+        [MODEL_KEY]: model(),
+        [EFFORT_KEY]: effort(),
+        [FAST_KEY]: String(fastMode()),
+        [VOICE_PROVIDER_KEY]: voiceProvider(),
+        [SPEACHES_ENGLISH_KEY]: String(speachesForceEnglish()),
+        [VOICE_AUTO_START_KEY]: String(voiceAutoStart()),
+        [HERMES_REMOTE_KEY]: String(remoteHermes()),
+        [HERMES_ADDRESS_KEY]: hermesAddress().trim(),
+        [HERMES_PORT_KEY]: hermesPort().trim(),
+        [HERMES_TOKEN_KEY]: hermesToken().trim(),
+        [SESSION_SHORTCUTS_KEY]: JSON.stringify(sessionShortcuts()),
+      })
+      await savePersistentSettings(persistent)
       localStorage.setItem(SESSION_PREFERENCE_KEY, sessionPreference())
       localStorage.setItem(MODEL_KEY, model())
       localStorage.setItem(EFFORT_KEY, effort())
@@ -689,13 +709,10 @@ function PromptWindow() {
       localStorage.setItem(VOICE_PROVIDER_KEY, voiceProvider())
       localStorage.setItem(SPEACHES_ENGLISH_KEY, String(speachesForceEnglish()))
       localStorage.setItem(VOICE_AUTO_START_KEY, String(voiceAutoStart()))
-      const instance = currentHermesInstance()
-      await invoke('configure_hermes_instance', { config: instance })
       localStorage.setItem(HERMES_REMOTE_KEY, String(remoteHermes()))
       localStorage.setItem(HERMES_ADDRESS_KEY, hermesAddress().trim())
       localStorage.setItem(HERMES_PORT_KEY, hermesPort().trim())
       localStorage.setItem(HERMES_TOKEN_KEY, hermesToken().trim())
-      await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
       localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(sessionShortcuts()))
       if (history().length === 0) {
         setActiveSession(sessionPreference())

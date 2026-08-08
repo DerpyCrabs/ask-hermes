@@ -43,6 +43,19 @@ npm run tauri dev
 
 Build the NSIS installer with `npm run tauri build`.
 
+## Settings file
+
+Ask Hermes stores settings in `%APPDATA%\app.hermes.ask\settings.json`. Existing browser-backed settings migrate automatically when this file is first created.
+
+Use a different settings file for a separate profile:
+
+```powershell
+ask-hermes.exe --config C:\path\to\work-settings.json
+ask-hermes.exe --config=C:\path\to\work-settings.json
+```
+
+Relative paths resolve from the process working directory. A missing custom file starts with defaults instead of importing another profile.
+
 ## License
 
 [MIT](LICENSE)
