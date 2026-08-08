@@ -17,10 +17,13 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(windows)]
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+};
+use tauri::{
+    menu::{Menu, MenuItem, Submenu},
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -65,7 +68,6 @@ mod native_text {
 
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-#[cfg(windows)]
 #[derive(Debug, Serialize)]
 struct HermesSession {
     id: String,
@@ -273,6 +275,7 @@ struct SessionShortcutConfig {
 }
 
 const DEFAULT_PROMPT_SHORTCUT: &str = "Alt+Space";
+#[cfg(windows)]
 const TRAY_ICON_ID: &str = "ask-hermes-tray";
 const PROMPT_SHORTCUT_CONFIG_FILE: &str = "prompt-shortcut.json";
 
@@ -403,6 +406,7 @@ struct WorkspaceQuitRequest {
 struct WorkspaceQuitState(Mutex<Option<WorkspaceQuitRequest>>);
 
 impl WorkspaceQuitState {
+    #[allow(dead_code)]
     fn queue(&self, confirmation_required: bool) -> Result<WorkspaceQuitRequest, String> {
         let mut pending = self
             .0
@@ -611,6 +615,12 @@ fn hermes_home() -> Result<PathBuf, String> {
 }
 
 fn hermes_binary() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("HERMES_AGENT_BINARY") {
+        let path = PathBuf::from(value);
+        return path.is_file().then_some(path).ok_or_else(|| {
+            "HERMES_AGENT_BINARY does not point to a Hermes Agent executable".to_string()
+        });
+    }
     let root = hermes_home()?;
     let mut candidates = Vec::new();
     #[cfg(windows)]
@@ -632,10 +642,10 @@ fn hermes_binary() -> Result<PathBuf, String> {
 }
 
 fn desktop_binary() -> Result<PathBuf, String> {
-    let root = hermes_home()?;
-    let release = root.join("hermes-agent/apps/desktop/release");
     #[cfg(windows)]
     {
+        let root = hermes_home()?;
+        let release = root.join("hermes-agent/apps/desktop/release");
         let direct = release.join("win-unpacked/Hermes.exe");
         if direct.is_file() {
             return Ok(direct);
@@ -1101,6 +1111,7 @@ fn start_hermes_backend_for_profile(profile: Option<&str>) -> Result<HermesBacke
         command.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
     }
 
+    #[allow(unused_mut)]
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start the Hermes gateway: {error}"))?;
@@ -1174,6 +1185,7 @@ fn start_hermes_backend_for_profile(profile: Option<&str>) -> Result<HermesBacke
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
     start_hermes_backend_for_profile(None)
 }
@@ -1709,9 +1721,11 @@ fn spawn_speaches() -> Result<SpeachesProcess, String> {
         use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
         command.creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0);
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("Could not start native Speaches: {error}"))?;
+    #[cfg(windows)]
+    let mut child = child;
     #[cfg(windows)]
     let job = match assign_process_job_and_resume(&child) {
         Ok(job) => job,
@@ -2424,8 +2438,11 @@ async fn set_shortcuts(
             .map_err(|_| "Shortcut configuration state is unavailable")?;
         *active = applied;
     }
-    if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
-        let _ = tray.set_tooltip(Some(format!("Ask Hermes — {applied_prompt}")));
+    #[cfg(windows)]
+    {
+        if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+            let _ = tray.set_tooltip(Some(format!("Ask Hermes — {applied_prompt}")));
+        }
     }
     let titles = if applied_sessions.is_empty() {
         HashMap::new()
@@ -2812,6 +2829,7 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn show_settings(app: &AppHandle) {
     if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
         *active = None;
@@ -3165,6 +3183,7 @@ fn emit_pending_workspace_quit(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[allow(dead_code)]
 fn request_workspace_quit(app: &AppHandle, confirmation_required: bool) -> Result<(), String> {
     app.state::<WorkspaceQuitState>()
         .queue(confirmation_required)?;
@@ -3278,6 +3297,7 @@ fn show_prompt(app: &AppHandle) {
     }
 }
 
+#[cfg(windows)]
 fn tray_icon() -> Image<'static> {
     let source = image::load_from_memory(include_bytes!("../icons/hermes-tray-source.png"))
         .expect("embedded Hermes tray icon must be a valid PNG")
@@ -3374,6 +3394,18 @@ pub fn run() {
                     let _ = window.emit("clear-prompt", ());
                     let _ = window.hide();
                 } else if window.label() == "workspace" {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let app = window.app_handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            let has_active_work =
+                                workspace::refresh_authoritative_active_work(&app)
+                                    .await
+                                    .unwrap_or(true);
+                            let _ = request_workspace_quit(&app, has_active_work);
+                        });
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     if let Some(workspace) = window.app_handle().get_webview_window("workspace") {
                         let _ = hide_workspace_window(&workspace);
                     }
@@ -3396,7 +3428,6 @@ pub fn run() {
             _ => {}
         })
         .setup(move |app| {
-            #[cfg(windows)]
             app.handle().plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 None,
@@ -3409,6 +3440,7 @@ pub fn run() {
             let mut initial_shortcuts =
                 validate_shortcut_configuration(&persisted_prompt_shortcut, &[])
                     .unwrap_or_else(|_| ActiveShortcutConfiguration::default());
+            #[cfg(windows)]
             let initial_prompt_shortcut = initial_shortcuts.prompt_shortcut.clone();
             let initial_prompt = initial_shortcuts.prompt;
             initial_shortcuts.registered.clear();
@@ -3494,75 +3526,85 @@ pub fn run() {
                 } else {
                     let _ = record_workspace_geometry(&workspace);
                 }
+                if cfg!(target_os = "linux")
+                    || env::var_os("ASK_HERMES_E2E_OPEN_WORKSPACE").is_some()
+                {
+                    show_workspace_window(app.handle(), WorkspaceOpenTarget::default())?;
+                }
             }
-            TrayIconBuilder::with_id(TRAY_ICON_ID)
-                .icon(tray_icon())
-                .tooltip(format!("Ask Hermes — {initial_prompt_shortcut}"))
-                .menu(&menu)
-                .on_tray_icon_event(|tray, event| {
-                    if matches!(
-                        event,
-                        TrayIconEvent::DoubleClick {
-                            button: MouseButton::Left,
-                            ..
-                        }
-                    ) {
-                        let _ = show_workspace_window(
-                            tray.app_handle(),
-                            WorkspaceOpenTarget::default(),
-                        );
-                    }
-                })
-                .on_menu_event(|app, event| {
-                    let item_id = event.id().as_ref();
-                    match item_id {
-                        "show" => show_prompt(app),
-                        "open-workspace" => {
-                            let _ = show_workspace_window(app, WorkspaceOpenTarget::default());
-                        }
-                        "previous" => {
-                            if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
-                                *active = None;
+            #[cfg(windows)]
+            {
+                TrayIconBuilder::with_id(TRAY_ICON_ID)
+                    .icon(tray_icon())
+                    .tooltip(format!("Ask Hermes — {initial_prompt_shortcut}"))
+                    .menu(&menu)
+                    .on_tray_icon_event(|tray, event| {
+                        if matches!(
+                            event,
+                            TrayIconEvent::DoubleClick {
+                                button: MouseButton::Left,
+                                ..
                             }
-                            if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
-                                *open = false;
+                        ) {
+                            let _ = show_workspace_window(
+                                tray.app_handle(),
+                                WorkspaceOpenTarget::default(),
+                            );
+                        }
+                    })
+                    .on_menu_event(|app, event| {
+                        let item_id = event.id().as_ref();
+                        match item_id {
+                            "show" => show_prompt(app),
+                            "open-workspace" => {
+                                let _ = show_workspace_window(app, WorkspaceOpenTarget::default());
                             }
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = show_main_above_capture(&window);
-                                let _ = window.emit("open-previous-chat", ());
+                            "previous" => {
+                                if let Ok(mut active) =
+                                    app.state::<ActiveSessionShortcut>().0.lock()
+                                {
+                                    *active = None;
+                                }
+                                if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
+                                    *open = false;
+                                }
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = show_main_above_capture(&window);
+                                    let _ = window.emit("open-previous-chat", ());
+                                }
                             }
-                        }
-                        "settings" => show_settings(app),
-                        "open-desktop" => {
-                            let _ = open_hermes_desktop();
-                        }
-                        "quit" => {
-                            let app = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let has_active_work =
-                                    workspace::refresh_authoritative_active_work(&app)
-                                        .await
-                                        .unwrap_or(true);
-                                // Workspace renderer owns the persistence flush
-                                // and is the sole bridge to quit_app_confirmed.
-                                let _ = request_workspace_quit(&app, has_active_work);
-                            });
-                        }
-                        _ if item_id.starts_with("session-shortcut-") => {
-                            let session_id = app
-                                .state::<SessionShortcutTrayState>()
-                                .0
-                                .lock()
-                                .ok()
-                                .and_then(|tray| tray.session_by_item.get(item_id).cloned());
-                            if let Some(session_id) = session_id {
-                                show_session_shortcut(app, &session_id);
+                            "settings" => show_settings(app),
+                            "open-desktop" => {
+                                let _ = open_hermes_desktop();
                             }
+                            "quit" => {
+                                let app = app.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let has_active_work =
+                                        workspace::refresh_authoritative_active_work(&app)
+                                            .await
+                                            .unwrap_or(true);
+                                    // Workspace renderer owns the persistence flush
+                                    // and is the sole bridge to quit_app_confirmed.
+                                    let _ = request_workspace_quit(&app, has_active_work);
+                                });
+                            }
+                            _ if item_id.starts_with("session-shortcut-") => {
+                                let session_id = app
+                                    .state::<SessionShortcutTrayState>()
+                                    .0
+                                    .lock()
+                                    .ok()
+                                    .and_then(|tray| tray.session_by_item.get(item_id).cloned());
+                                if let Some(session_id) = session_id {
+                                    show_session_shortcut(app, &session_id);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                })
-                .build(app)?;
+                    })
+                    .build(app)?;
+            }
             if env::var_os(WORKSPACE_STARTUP_SMOKE_READY_FILE_ENV).is_some() {
                 let _ = show_workspace_window(app.handle(), WorkspaceOpenTarget::default());
             }

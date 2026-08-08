@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:release": "tauri build --no-bundle",
+    "e2e:linux": "npm run build:release && node e2e/workspace-linux.mjs",
+    "e2e:linux:run": "node e2e/workspace-linux.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:startup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-startup.ps1",
@@ -27,6 +29,7 @@
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
     "vite-plugin-solid": "^2.11.13",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "webdriverio": "^9.30.0"
   }
 }

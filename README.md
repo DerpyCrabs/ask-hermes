@@ -1,6 +1,6 @@
 # Ask Hermes
 
-A lightweight Windows tray app for asking your local Hermes agent from anywhere.
+A lightweight Windows and Linux desktop app for asking your local Hermes agent from anywhere.
 
 ![Ask Hermes prompt with a screen capture](docs/prompt-with-capture.png)
 
@@ -18,13 +18,19 @@ Press the configurable global shortcut (**Alt+Space** by default), type a questi
 - Voice input with **Ctrl+Shift+D** or the microphone button
 - Automatic end-of-speech detection for both voice providers
 - Hermes-native transcription, or optional realtime audio streaming to local Speaches
-- Configurable model, thinking effort, and Windows startup
+- Configurable model, thinking effort, and startup behavior
 - Open Hermes Desktop from the answer window
+- Full Hermes workspace with chats, queues, search, lifecycle actions, and schedules
 
 ## Requirements
 
-- Windows 10 or 11
+- Windows 10 or 11, or a Linux desktop with WebKitGTK 4.1
 - Hermes Agent installed and configured
+
+On Linux, Ask Hermes looks for Hermes Agent at
+`~/.hermes/hermes-agent/venv/bin/hermes`. Set `HERMES_AGENT_BINARY` to use a
+different executable. The workspace opens directly at launch on Linux. Windows
+keeps the tray-based quick-prompt behavior.
 
 ## Voice input
 
@@ -35,13 +41,31 @@ Choose a provider in **Settings → Voice input**:
 
 ## Development
 
-```powershell
+```sh
 npm install
 npm test
 npm run tauri dev
 ```
 
-Build the NSIS installer with `npm run tauri build`.
+`npm run tauri build` creates an NSIS installer on Windows and a Debian package
+on Linux. `npm run build:release` also produces a directly runnable Linux
+binary at `src-tauri/target/release/ask-hermes`.
+
+### Linux end-to-end test
+
+The Linux E2E test drives the real release build through WebDriver, starts a
+real Hermes Agent in an isolated state directory, and routes its OpenAI
+Responses calls to a deterministic local mock provider:
+
+```sh
+cargo install tauri-driver --locked
+npm run e2e:linux
+```
+
+It requires `WebKitWebDriver`. Headless environments also need Xvfb; the test
+starts it automatically when no display is configured. On Debian/Ubuntu, the
+usual development packages are `libwebkit2gtk-4.1-dev`,
+`librsvg2-dev`, `patchelf`, and `xvfb`.
 
 ## License
 

@@ -378,6 +378,7 @@ export type WorkspaceEvent =
   | { type: 'snapshot-invalidated'; profileId?: string }
   | { type: 'session-upsert'; session: SessionSummary }
   | { type: 'session-settings'; profileId: string; sessionId: string; settings: TurnSettings }
+  | { type: 'session-rotate'; profileId: string; previousSessionId: string; sessionId: string }
   | { type: 'session-remove'; profileId: string; sessionId: string }
   | { type: 'message-upsert'; message: WorkspaceMessage }
   | { type: 'message-delta'; profileId: string; sessionId: string; messageId: string; delta: string }

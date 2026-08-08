@@ -10,6 +10,7 @@ import type {
   WorkspaceCapabilities,
   WorkspaceEvent,
   WorkspaceMessage,
+  WorkspaceSelection,
 } from './types'
 import { workspaceText as text } from './strings'
 
@@ -53,6 +54,20 @@ export function capability(capabilities: WorkspaceCapabilities | undefined, name
 }
 
 export const safeExternalUrl = (value: string) => /^(https?:|mailto:)/i.test(value) ? value : undefined
+
+/** Follow compression only when the foreground still points at its predecessor. */
+export function rotateChatSelection(
+  selection: WorkspaceSelection,
+  profileId: string,
+  previousSessionId: string,
+  sessionId: string,
+): WorkspaceSelection {
+  return selection.kind === 'chat'
+    && selection.profileId === profileId
+    && selection.id === previousSessionId
+    ? { ...selection, id: sessionId }
+    : selection
+}
 
 export function lifecycleMutationBlockReason(session: SessionSummary, state: SessionClientState) {
   if (session.turnState === 'running' || session.turnState === 'stopping' || session.turnState === 'stalled') {
@@ -118,6 +133,42 @@ export const hasBlockingWork = (sessions: SessionSummary[], states: Record<strin
 
 export const hasClientStateContent = (state: SessionClientState) =>
   Boolean(state.draft || state.queue.length || state.attachments.length)
+
+export function transcriptNeedsReconciliation(messages: readonly WorkspaceMessage[]) {
+  let lastUser = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') {
+      lastUser = index
+      break
+    }
+  }
+  if (lastUser < 0) return false
+  return !messages.slice(lastUser + 1).some(message =>
+    message.role === 'assistant'
+    && message.status !== 'streaming'
+    && Boolean(message.content.trim() || message.tools?.length || message.error))
+}
+
+function transcriptResponseProgress(messages: readonly WorkspaceMessage[]) {
+  let lastUser = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') {
+      lastUser = index
+      break
+    }
+  }
+  if (lastUser < 0) return 0
+  const responses = messages.slice(lastUser + 1).filter(message => message.role === 'assistant')
+  if (responses.some(message =>
+    message.status !== 'streaming'
+    && Boolean(message.content.trim() || message.tools?.length || message.error))) return 2
+  return responses.length ? 1 : 0
+}
+
+/** Let concurrent same-chat recovery loads settle without rolling transcript backward. */
+export function reconcileTranscriptPage(current: WorkspaceMessage[], incoming: WorkspaceMessage[]) {
+  return transcriptResponseProgress(incoming) < transcriptResponseProgress(current) ? current : incoming
+}
 
 export function unavailableSessionSummary(
   profileId: string,
@@ -252,6 +303,14 @@ export function reduceCollections(collections: WorkspaceCollections, event: Work
           ? { ...item, settings: { ...item.settings, ...event.settings } }
           : item),
       }
+    case 'session-rotate':
+      return {
+        ...collections,
+        sessions: collections.sessions.map(item =>
+          item.id === event.previousSessionId && item.profileId === event.profileId
+            ? { ...item, id: event.sessionId }
+            : item),
+      }
     case 'turn-state':
       return {
         ...collections,
@@ -269,6 +328,13 @@ export function reduceCollections(collections: WorkspaceCollections, event: Work
 }
 
 export function reduceMessages(messages: WorkspaceMessage[], event: WorkspaceEvent, profileId: string, sessionId: string) {
+  if (event.type === 'session-rotate'
+    && event.profileId === profileId
+    && event.previousSessionId === sessionId) {
+    return messages.map(message => message.profileId === profileId && message.sessionId === sessionId
+      ? { ...message, sessionId: event.sessionId }
+      : message)
+  }
   if (event.type === 'message-upsert' && event.message.profileId === profileId && event.message.sessionId === sessionId) {
     return upsert(messages, event.message, item => item.id)
   }

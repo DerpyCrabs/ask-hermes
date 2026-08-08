@@ -6,6 +6,7 @@ import {
   parseWorkspaceNotificationPreferences,
   schedulesNeedBackgroundPolling,
   scheduleTransitionNotification,
+  shouldSendNativeNotification,
   workspaceNeedsBackgroundMonitoring,
   writeWorkspaceNotificationPreferences,
   WORKSPACE_NOTIFICATIONS_KEY,
@@ -71,5 +72,14 @@ describe('workspace notification preferences', () => {
     expect(workspaceNeedsBackgroundMonitoring(disabled, false, true)).toBe(true)
     expect(workspaceNeedsBackgroundMonitoring({ ...disabled, interactionRequired: true }, false, false)).toBe(true)
     expect(workspaceNeedsBackgroundMonitoring({ ...disabled, scheduleCompletion: true }, false, false)).toBe(true)
+  })
+
+  it('notifies focused users only for off-screen chat completion or attention', () => {
+    expect(shouldSendNativeNotification('turnCompletion', true, true)).toBe(false)
+    expect(shouldSendNativeNotification('interactionRequired', true, true)).toBe(false)
+    expect(shouldSendNativeNotification('turnCompletion', true, false)).toBe(true)
+    expect(shouldSendNativeNotification('interactionRequired', true, false)).toBe(true)
+    expect(shouldSendNativeNotification('scheduleFailure', true, false)).toBe(false)
+    expect(shouldSendNativeNotification('scheduleCompletion', false, false)).toBe(true)
   })
 })

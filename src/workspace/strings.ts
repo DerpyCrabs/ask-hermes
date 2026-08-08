@@ -60,6 +60,8 @@ export const workspaceText = {
   output: 'output',
   total: 'total',
   context: 'context',
+  contextWindow: 'context window',
+  estimatedCost: 'estimated cost',
   reasoning: 'Reasoning',
   tokens: 'tokens',
   historicalRequest: 'Historical request — respond from the client that owns the turn.',

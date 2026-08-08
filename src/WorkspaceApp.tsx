@@ -42,9 +42,10 @@ import { ACTIVE_INSTANCE_KEY, INSTANCES_KEY, activeSavedInstance, instanceConfig
 import { HermesRecording, blobToDataUrl, microphoneErrorMessage, preferredAudioMimeType, type VoiceInputStatus } from './voice-input'
 import { SpeachesRealtimeSession, speachesRealtimeUrl } from './speaches-realtime'
 import { workspaceCommands, type InstanceScope, type WorkspaceCommands } from './workspace/commands'
+import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory, resetBrowseState } from './workspace/composer-history'
 import { downloadGatewayFile, gatewayLocalFilePath, safeGatewayDataUrl, safeInlineImageSource } from './workspace/gateway-files'
 import { defaultWorkspaceUi, parseSessionScopeKey, readWorkspaceUi, sanitizeClientState, sanitizeInstanceClientStates, sessionScopeKey, writeWorkspaceUi, type PersistedWorkspaceUi } from './workspace/persistence'
-import { isTurnCompletion, notificationEnabled, readWorkspaceNotificationPreferences, scheduleTransitionNotification, schedulesNeedBackgroundPolling, workspaceNeedsBackgroundMonitoring, type WorkspaceNotificationKind } from './workspace/notifications'
+import { isTurnCompletion, notificationEnabled, readWorkspaceNotificationPreferences, scheduleTransitionNotification, schedulesNeedBackgroundPolling, shouldSendNativeNotification, workspaceNeedsBackgroundMonitoring, type WorkspaceNotificationKind } from './workspace/notifications'
 import {
   capability,
   applyClientStateMutation,
@@ -53,8 +54,10 @@ import {
   composerSubmissionText,
   newQueueEntry,
   queueDrainTransition,
+  reconcileTranscriptPage,
   reduceCollections,
   reduceMessages,
+  rotateChatSelection,
   schedulesForProfile,
   hasBlockingWork,
   hasClientStateContent,
@@ -64,6 +67,7 @@ import {
   overlayPendingDraft,
   safeExternalUrl,
   topLevelSessions,
+  transcriptNeedsReconciliation,
   unavailableSessionSummary,
 } from './workspace/state'
 import { workspaceText as text } from './workspace/strings'
@@ -100,6 +104,7 @@ import type {
   WorkspaceSnapshot,
   WorkspaceCapabilities,
 } from './workspace/types'
+
 import type { QueueDrainPhase } from './workspace/state'
 import './workspace.css'
 
@@ -329,6 +334,69 @@ function TodoList(props: { todos: NonNullable<WorkspaceMessage['todos']> }) {
   )
 }
 
+function UsageDetails(props: { message: WorkspaceMessage }) {
+  const messageUsage = () => props.message.usage
+  const sessionUsage = () => props.message.sessionUsage
+  const numeric = (...values: unknown[]) => values.find(value => typeof value === 'number' && Number.isFinite(value)) as number | undefined
+  const messageInput = () => numeric(messageUsage()?.inputTokens)
+  const messageOutput = () => numeric(messageUsage()?.outputTokens)
+  const messageTotal = () => numeric(messageUsage()?.totalTokens, props.message.totalTokens)
+  const displayedTotal = () => numeric(messageTotal(), sessionUsage()?.totalTokens)
+  const contextUsed = () => numeric(sessionUsage()?.contextTokens, messageUsage()?.contextTokens, props.message.contextTokens)
+  const contextMax = () => numeric(sessionUsage()?.contextMaxTokens, messageUsage()?.contextMaxTokens)
+  const estimatedCost = () => numeric(messageUsage()?.costUsd, sessionUsage()?.costUsd)
+  const contextPercent = () => {
+    const used = contextUsed()
+    const max = contextMax()
+    return used !== undefined && max && max > 0 ? Math.min(100, Math.round((used / max) * 100)) : undefined
+  }
+  const hasUsage = () => [
+    messageInput(),
+    messageOutput(),
+    displayedTotal(),
+    contextUsed(),
+    contextMax(),
+    estimatedCost(),
+    numeric(sessionUsage()?.inputTokens),
+    numeric(sessionUsage()?.outputTokens),
+  ].some(value => value !== undefined)
+  const formatTokens = (value: number | undefined) => value === undefined ? text.notAvailable : value.toLocaleString()
+
+  return <Show when={hasUsage()}>
+    <details class="workspace-rich-details workspace-usage">
+      <summary>{text.tokenUsage}
+        <Show when={displayedTotal()}>
+          {total => <span>{formatTokens(total())} {text.tokens}</span>}
+        </Show>
+      </summary>
+      <dl>
+        <Show when={messageInput() !== undefined}>
+          <div><dt>{text.message} {text.input}</dt><dd>{formatTokens(messageInput())}</dd></div>
+        </Show>
+        <Show when={messageOutput() !== undefined}>
+          <div><dt>{text.message} {text.output}</dt><dd>{formatTokens(messageOutput())}</dd></div>
+        </Show>
+        <Show when={messageTotal() !== undefined}>
+          <div><dt>{text.message} {text.total}</dt><dd>{formatTokens(messageTotal())}</dd></div>
+        </Show>
+        <Show when={messageTotal() === undefined && sessionUsage()?.totalTokens !== undefined}>
+          <div><dt>{text.session} {text.total}</dt><dd>{formatTokens(sessionUsage()?.totalTokens)}</dd></div>
+        </Show>
+        <Show when={contextUsed() !== undefined}>
+          <div><dt>{text.session} {text.context}</dt><dd>
+            {formatTokens(contextUsed())}
+            <Show when={contextMax()}>{max => <> / {formatTokens(max())}</>}</Show>
+            <Show when={contextPercent()}>{percent => <> ({percent()}%)</>}</Show>
+          </dd></div>
+        </Show>
+        <Show when={estimatedCost() !== undefined}>
+          <div><dt>{text.estimatedCost}</dt><dd>${estimatedCost()!.toFixed(4)}</dd></div>
+        </Show>
+      </dl>
+    </details>
+  </Show>
+}
+
 type GatewayFileViewProps = {
   gatewayFileReason?: string
   onReadGatewayFile?(path: string): Promise<GatewayFileData>
@@ -525,6 +593,7 @@ export function MessageCard(props: {
       </Show>
       <Show when={props.message.tools?.length}><ToolCalls tools={props.message.tools!} /></Show>
       <Show when={props.message.todos?.length}><TodoList todos={props.message.todos!} /></Show>
+      <UsageDetails message={props.message} />
       <Show when={props.message.artifacts?.length}><ArtifactList artifacts={props.message.artifacts!} onOpenLink={props.onOpenLink}
         gatewayFileReason={props.gatewayFileReason} onReadGatewayFile={props.onReadGatewayFile}
         onOpenGatewayFile={props.onOpenGatewayFile} /></Show>
@@ -623,6 +692,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
   const queueDrainsInFlight = new Set<string>()
   const failedQueueDrains = new Set<string>()
   const observedTurnStates = new Map<string, TurnState>()
+  const awaitingTranscriptSettlement = new Map<string, number>()
   const profileChoiceRequests = new Map<string, Promise<void>>()
   const sessionSummaryRequests = new Map<string, Promise<SessionSummary>>()
   const pendingMessageDeltas = new Map<string, Extract<WorkspaceEvent, { type: 'message-delta' }>>()
@@ -653,6 +723,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
   const [navigation, setNavigation] = createSignal<WorkspaceNavigation>(initial.navigation)
   const [sidebarCollapsed, setSidebarCollapsed] = createSignal(initial.sidebarCollapsed)
   const [expandedSections, setExpandedSections] = createSignal(initial.expandedSections)
+  const [pinnedSessionScopes, setPinnedSessionScopes] = createSignal(initial.pinnedSessions)
   const [clientStates, setClientStates] = createSignal<Record<string, SessionClientState>>(initial.sessions)
   const [messages, setMessages] = createSignal<WorkspaceMessage[]>([])
   const [olderCursor, setOlderCursor] = createSignal<string>()
@@ -776,9 +847,18 @@ function WorkspaceApp(props: WorkspaceAppProps) {
   }
 
   const allProfiles = createMemo(() => !profileId())
+  const sessionIsPinned = (session: Pick<SessionSummary, 'profileId' | 'id'>) =>
+    pinnedSessionScopes().includes(sessionScopeKey(clientInstanceId(), session.profileId, session.id))
+  const withLocalPin = (session: SessionSummary): SessionSummary => ({
+    ...session,
+    pinned: sessionIsPinned(session),
+  })
   const selectedSession = createMemo(() => {
     const selected = selection()
-    return selected.kind === 'chat' ? sessions().find(item => item.id === selected.id && item.profileId === selected.profileId) : undefined
+    const session = selected.kind === 'chat'
+      ? sessions().find(item => item.id === selected.id && item.profileId === selected.profileId)
+      : undefined
+    return session ? withLocalPin(session) : undefined
   })
   const selectedSchedule = createMemo(() => {
     const selected = selection()
@@ -802,7 +882,11 @@ function WorkspaceApp(props: WorkspaceAppProps) {
       && item.parentSessionId === selected.id
       && (item.source === 'subagent' || item.source === 'background'))
   })
-  const visibleSessions = createMemo(() => topLevelSessions(sessions(), profileId() || undefined, navigation() === 'archived'))
+  const visibleSessions = createMemo(() => topLevelSessions(
+    sessions().map(withLocalPin),
+    profileId() || undefined,
+    navigation() === 'archived',
+  ))
   const pinnedSessions = createMemo(() => visibleSessions().filter(item => item.pinned))
   const recentSessions = createMemo(() => visibleSessions().filter(item => !item.pinned))
   const scopedSchedules = createMemo(() => schedulesForProfile(schedules(), profileId() || undefined))
@@ -913,7 +997,8 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     try {
       const windows = (await getAllWindows()).filter(item => item.label === 'main' || item.label === 'workspace')
       const focus = await Promise.all(windows.map(item => item.isFocused().catch(() => false)))
-      if (focus.some(Boolean)) return
+      const targetSelected = Boolean(target.sessionId && selectedIs(target.profileId, target.sessionId))
+      if (!shouldSendNativeNotification(kind, focus.some(Boolean), targetSelected)) return
       const granted = await isPermissionGranted()
       if (!granted && await requestPermission() !== 'granted') return
       if (!instanceContinuationIsCurrent(continuation)) return
@@ -1059,7 +1144,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     navigation: navigation(),
     sidebarCollapsed: sidebarCollapsed(),
     expandedSections: expandedSections(),
-    pinnedSessions: [],
+    pinnedSessions: pinnedSessionScopes(),
     sessions: clientStates(),
   })
 
@@ -1400,10 +1485,11 @@ function WorkspaceApp(props: WorkspaceAppProps) {
           })
         }
         const selected = selection()
+        const awaitingSettlement = awaitingTranscriptSettlement.has(drainKey(next.profileId, next.id))
         if (selected.kind === 'chat'
           && selected.profileId === next.profileId
           && selected.id === next.id
-          && previous?.updatedAt !== next.updatedAt
+          && (awaitingSettlement || previous?.updatedAt !== next.updatedAt || isTurnCompletion(previous?.turnState, next.turnState))
           && !['running', 'stopping', 'stalled'].includes(next.turnState)) {
           selectedMessagesChanged = { profileId: next.profileId, sessionId: next.id }
         }
@@ -1833,6 +1919,18 @@ function WorkspaceApp(props: WorkspaceAppProps) {
         }
       }
       applyRefresh(result, scope)
+      const selectedAfterRefresh = selection()
+      const refreshedSelected = selectedAfterRefresh.kind === 'chat'
+        ? result.sessions?.find(session =>
+          session.profileId === selectedAfterRefresh.profileId && session.id === selectedAfterRefresh.id)
+        : undefined
+      if (selectedAfterRefresh.kind === 'chat'
+        && refreshedSelected
+        && (refreshedSelected.turnState === 'idle' || refreshedSelected.turnState === 'error')
+        && (awaitingTranscriptSettlement.has(drainKey(selectedAfterRefresh.profileId, selectedAfterRefresh.id))
+          || transcriptNeedsReconciliation(messages()))) {
+        void loadMessagePage(selectedAfterRefresh.profileId, selectedAfterRefresh.id, undefined, undefined, true)
+      }
       const currentInstance = snapshot()
       const instanceId = currentInstance?.instance.id
       if (currentInstance && instanceId && [...recoverySeeds.keys()].some(key => parseSessionScopeKey(key)?.instanceId === instanceId)) {
@@ -1946,24 +2044,34 @@ function WorkspaceApp(props: WorkspaceAppProps) {
       })
       const selected = selection()
       if (!instanceContinuationIsCurrent(continuation)
-        || generation !== loadGeneration
+        || (!preserveViewport && generation !== loadGeneration)
         || navigation !== navigationGeneration
         || selected.kind !== 'chat'
         || selected.profileId !== profile
         || selected.id !== session) return
+      const settlementKey = drainKey(profile, session)
+      const submittedAt = awaitingTranscriptSettlement.get(settlementKey)
+      if (submittedAt !== undefined && page.messages.some(message =>
+        message.role === 'assistant'
+        && message.status !== 'streaming'
+        && Boolean(message.content.trim() || message.tools?.length || message.error)
+        && (Date.parse(message.createdAt) || 0) >= submittedAt - 1_000)) {
+        awaitingTranscriptSettlement.delete(settlementKey)
+      }
       setMessages(current => {
         if (before) return [...page.messages, ...current]
         if (!preserveViewport) return page.messages
         const incomingIds = new Set(page.messages.map(message => message.id))
         const firstOverlap = current.findIndex(message => incomingIds.has(message.id))
-        return firstOverlap > 0 ? [...current.slice(0, firstOverlap), ...page.messages] : page.messages
+        const incoming = firstOverlap > 0 ? [...current.slice(0, firstOverlap), ...page.messages] : page.messages
+        return reconcileTranscriptPage(current, incoming)
       })
       setOlderCursor(page.olderCursor)
       setHasOlder(page.hasOlder)
       window.requestAnimationFrame(() => {
         const current = selection()
         if (!instanceContinuationIsCurrent(continuation)
-          || generation !== loadGeneration
+          || (!preserveViewport && generation !== loadGeneration)
           || navigation !== navigationGeneration
           || current.kind !== 'chat'
           || current.profileId !== profile
@@ -1977,7 +2085,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
         } else if (!before && aroundMessageId) centerTranscriptMessage(aroundMessageId, () => {
           const selected = selection()
           return instanceContinuationIsCurrent(continuation)
-            && generation === loadGeneration
+            && (preserveViewport || generation === loadGeneration)
             && navigation === navigationGeneration
             && selected.kind === 'chat'
             && selected.profileId === profile
@@ -2004,6 +2112,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     const continuation = captureInstanceContinuation()
     const previous = selection()
     if (previous.kind === 'chat') {
+      resetBrowseState(settingsKeyFor(previous.profileId, previous.id))
       messageCache.set(`${previous.profileId}\0${previous.id}`, {
         messages: messages(),
         olderCursor: olderCursor(),
@@ -2160,6 +2269,14 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     }
     const continuation = captureInstanceContinuation()
     try {
+      if (action.kind === 'pin') {
+        const scope = sessionScopeKey(clientInstanceId(), session.profileId, session.id)
+        setPinnedSessionScopes(current => action.pinned
+          ? current.includes(scope) ? current : [...current, scope]
+          : current.filter(item => item !== scope))
+        persistSoon()
+        return
+      }
       await ensureProfileConnected(session.profileId)
       if (!instanceContinuationIsCurrent(continuation)) return
       await api.sessionAction({ ...mutationScope(continuation), profileId: session.profileId, sessionId: session.id, action })
@@ -2169,6 +2286,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
         const key = sessionScopeKey(snapshot()?.instance.id || 'unknown', session.profileId, session.id)
         setClientStates(states => Object.fromEntries(Object.entries(states).filter(([scope]) => scope !== key)))
         setRuntimeSettings(items => Object.fromEntries(Object.entries(items).filter(([scope]) => scope !== key)))
+        setPinnedSessionScopes(items => items.filter(scope => scope !== key))
         const timer = draftTimers.get(key)
         if (timer !== undefined) window.clearTimeout(timer)
         draftTimers.delete(key)
@@ -2223,6 +2341,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     try {
       await api.sendTurn({ ...mutationScope(continuation), profileId: session.profileId, sessionId: session.id, entry })
       if (!instanceContinuationIsCurrent(continuation)) return 'stale'
+      awaitingTranscriptSettlement.set(drainKey(session.profileId, session.id), Date.parse(entry.createdAt) || Date.now())
       setSessions(items => items.map(item => item.id === session.id && item.profileId === session.profileId ? { ...item, turnState: 'running' } : item))
       if (selectedIs(session.profileId, session.id)) setMessages(items => items.map(message => message.id === entry.id ? { ...message, status: 'complete' as const } : message))
       return 'accepted'
@@ -2393,6 +2512,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     const session = selectedSession()
     if (!session || !isConnected()) return
     const continuation = captureInstanceContinuation()
+    resetBrowseState(settingsKeyFor(session.profileId, session.id))
     if (session.archived) { setError(text.restoreBeforeSending); return }
     let state = selectedClientState()
     if (state.attachments.some(item => item.state !== 'ready')) {
@@ -2948,6 +3068,99 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     }
   }
 
+  const rotateSessionScope = (profile: string, previousSession: string, session: string) => {
+    if (previousSession === session) return
+    const instance = clientInstanceId()
+    const previousScope = sessionScopeKey(instance, profile, previousSession)
+    const nextScope = sessionScopeKey(instance, profile, session)
+    const previousDrain = drainKey(profile, previousSession)
+    const nextDrain = drainKey(profile, session)
+    const moveMap = <T,>(map: Map<string, T>, previous: string, next: string, merge?: (previousValue: T, nextValue: T) => T) => {
+      const value = map.get(previous)
+      if (value === undefined) return
+      map.delete(previous)
+      const existing = map.get(next)
+      map.set(next, existing === undefined || !merge ? value : merge(value, existing))
+    }
+    const moveSet = (set: Set<string>, previous: string, next: string) => {
+      if (set.delete(previous)) set.add(next)
+    }
+
+    // Apply any queued deltas while the old route is still selected, then make
+    // every visible row point at the compressed successor.
+    if (messageDeltaFrame !== undefined) {
+      window.cancelAnimationFrame(messageDeltaFrame)
+      flushMessageDeltas()
+    }
+    setSessions(items => items.map(item => item.profileId === profile && item.id === previousSession
+      ? { ...item, id: session }
+      : item))
+    setMessages(items => items.map(item => item.profileId === profile && item.sessionId === previousSession
+      ? { ...item, sessionId: session }
+      : item))
+    setSelection(current => rotateChatSelection(current, profile, previousSession, session))
+    setClientStates(states => {
+      const previous = states[previousScope]
+      if (!previous) return states
+      const next = { ...states }
+      delete next[previousScope]
+      next[nextScope] = next[nextScope] ? mergeClientState(previous, next[nextScope]) : previous
+      return next
+    })
+    setRuntimeSettings(settings => {
+      if (!settings[previousScope]) return settings
+      const next = { ...settings, [nextScope]: { ...settings[previousScope], ...settings[nextScope] } }
+      delete next[previousScope]
+      return next
+    })
+    setPinnedSessionScopes(scopes => scopes.includes(previousScope)
+      ? [...new Set(scopes.map(scope => scope === previousScope ? nextScope : scope))]
+      : scopes)
+    setTurnStartedAt(values => {
+      const previous = `${profile}\0${previousSession}`
+      const nextKey = `${profile}\0${session}`
+      if (!values[previous]) return values
+      const moved = { ...values, [nextKey]: values[previous] }
+      delete moved[previous]
+      return moved
+    })
+
+    moveMap(queueDrainPhases, previousDrain, nextDrain)
+    moveSet(queueDrainsInFlight, previousDrain, nextDrain)
+    moveSet(failedQueueDrains, previousDrain, nextDrain)
+    moveMap(observedTurnStates, previousDrain, nextDrain)
+    moveMap(awaitingTranscriptSettlement, previousDrain, nextDrain)
+    moveMap(authoritativeClientStates, previousScope, nextScope, (previous, next) => mergeClientState(previous, next))
+    moveMap(deferredClientStateEvents, previousScope, nextScope)
+    moveMap(recoverySeeds, previousScope, nextScope, (previous, next) => mergeClientState(previous, next))
+    moveMap(recoveryIncomingStates, previousScope, nextScope, (previous, next) => mergeClientState(previous, next))
+
+    // A mutation already executing keeps its internal queue key until its
+    // promise settles, but its target follows the new id. Native aliases make
+    // an already-dispatched old-id command land on this same successor.
+    for (const pending of mutationQueues.get(previousScope) || []) {
+      pending.target = { ...pending.target, sessionId: session }
+    }
+    const pendingDraft = pendingDrafts.get(previousScope)
+    if (pendingDraft) pendingDraft.target = { ...pendingDraft.target, sessionId: session }
+    if (!mutationProcessing.has(previousScope)) {
+      moveMap(mutationQueues, previousScope, nextScope, (previous, next) => [...previous, ...next])
+    }
+    for (const source of attachmentUploadSources.values()) {
+      if (source.profile === profile && source.sessionId === previousSession) source.sessionId = session
+    }
+    if (voiceTarget?.profileId === profile && voiceTarget.sessionId === previousSession) {
+      voiceTarget = { ...voiceTarget, sessionId: session }
+    }
+    const previousCache = `${profile}\0${previousSession}`
+    const nextCache = `${profile}\0${session}`
+    moveMap(messageCache, previousCache, nextCache)
+    resetBrowseState(previousScope)
+    persistSoon()
+    workspaceActivated = true
+    void bootstrap(true)
+  }
+
   const handleEvent = (event: WorkspaceEvent) => {
     if (event.type === 'instance-invalidated') {
       const invalidatedInstanceId = snapshot()?.instance.id
@@ -2962,6 +3175,7 @@ function WorkspaceApp(props: WorkspaceAppProps) {
       flushPersistence()
       cancelInstanceContinuations()
       observedTurnStates.clear()
+      awaitingTranscriptSettlement.clear()
       queueDrainPhases.clear()
       queueDrainsInFlight.clear()
       failedQueueDrains.clear()
@@ -3013,6 +3227,10 @@ function WorkspaceApp(props: WorkspaceAppProps) {
       if (!document.hidden) void refresh(false, event.profileId)
       return
     }
+    if (event.type === 'session-rotate') {
+      rotateSessionScope(event.profileId, event.previousSessionId, event.sessionId)
+      return
+    }
     const eventSession = event.type === 'message-upsert'
       ? { profileId: event.message.profileId, sessionId: event.message.sessionId }
       : event.type === 'message-delta' || event.type === 'turn-state' || event.type === 'interaction' || event.type === 'session-settings'
@@ -3021,6 +3239,16 @@ function WorkspaceApp(props: WorkspaceAppProps) {
     if (eventSession && !sessions().some(item => item.id === eventSession.sessionId && item.profileId === eventSession.profileId)) {
       workspaceActivated = true
       void bootstrap(true)
+    }
+    if (event.type === 'message-upsert'
+      && event.message.role === 'assistant'
+      && event.message.status !== 'streaming'
+      && Boolean(event.message.content.trim() || event.message.tools?.length || event.message.error)) {
+      const key = drainKey(event.message.profileId, event.message.sessionId)
+      const submittedAt = awaitingTranscriptSettlement.get(key)
+      if (submittedAt !== undefined && (Date.parse(event.message.createdAt) || 0) >= submittedAt - 1_000) {
+        awaitingTranscriptSettlement.delete(key)
+      }
     }
     let shouldDrainQueue = false
     let ignoreTurnState = false
@@ -3133,11 +3361,42 @@ function WorkspaceApp(props: WorkspaceAppProps) {
       queueDrainsInFlight.delete(key)
       failedQueueDrains.delete(key)
       observedTurnStates.delete(key)
+      awaitingTranscriptSettlement.delete(key)
+    }
+    if (event.type === 'turn-state'
+      && (event.state === 'idle' || event.state === 'error' || event.state === 'stalled')
+      && selectedIs(event.profileId, event.sessionId)) {
+      // The Gateway can persist the final assistant row just before closing a
+      // detached stream without delivering message.complete to this WebView.
+      // Settlement or a recoverable disconnect must reconcile the transcript.
+      void loadMessagePage(event.profileId, event.sessionId, undefined, undefined, true)
     }
     if (event.type === 'turn-state' && shouldDrainQueue) void drainQueue(event.profileId, event.sessionId)
   }
 
   const onComposerKeyDown: JSX.EventHandler<HTMLTextAreaElement, KeyboardEvent> = event => {
+    const session = selectedSession()
+    if (session && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+      const scope = settingsKeyFor(session.profileId, session.id)
+      const draft = selectedClientState().draft
+      const history = deriveUserHistory(messages(), message => message.content)
+      if (event.key === 'ArrowUp' && (!draft.trim() || isBrowsingHistory(scope))) {
+        const entry = browseBackward(scope, draft, history)
+        if (entry !== undefined) {
+          event.preventDefault()
+          void mutateClientState(session.profileId, session.id, { kind: 'setDraft', draft: entry })
+          return
+        }
+      }
+      if (event.key === 'ArrowDown' && isBrowsingHistory(scope)) {
+        const entry = browseForward(scope, history)
+        if (entry !== undefined) {
+          event.preventDefault()
+          void mutateClientState(session.profileId, session.id, { kind: 'setDraft', draft: entry })
+          return
+        }
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void submit() }
     if (event.key === 'Escape' && selectedSession()?.turnState === 'running') void stopSession(selectedSession()!)
   }
@@ -3611,7 +3870,10 @@ function WorkspaceApp(props: WorkspaceAppProps) {
                 <Show when={slashCommands().length}><div class="workspace-command-menu"><For each={slashCommands()}>{command => <button onClick={() => setDebouncedDraft(session().profileId, session().id, `/${command.name.replace(/^\//, '')} `)}><strong>/{command.name.replace(/^\//, '')}</strong><span>{command.description}</span></button>}</For></div></Show>
                 <div class="workspace-composer" onDragOver={event => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { event.preventDefault(); if (event.dataTransfer) void uploadFiles(event.dataTransfer.files) }}>
                   <Show when={selectedClientState().attachments.length}><div class="workspace-composer-attachments"><For each={selectedClientState().attachments}>{attachment => <span classList={{ failed: attachment.state === 'failed' }} title={attachment.error}><Show when={attachment.state === 'uploading'} fallback={<Show when={attachment.mimeType.startsWith('image/') && attachment.previewUrl} fallback={<FileIcon size={13} />}>{preview => <img src={preview()} alt="" />}</Show>}><LoaderCircle class="workspace-spin" size={13} /></Show>{attachment.name}<button title={text.remove} onClick={() => removeComposerAttachment(session().profileId, session().id, attachment.id)}><X size={11} /></button></span>}</For></div></Show>
-                  <textarea ref={composerInput} value={selectedClientState().draft} onInput={event => setDebouncedDraft(session().profileId, session().id, event.currentTarget.value)} onKeyDown={onComposerKeyDown}
+                  <textarea ref={composerInput} value={selectedClientState().draft} onInput={event => {
+                    resetBrowseState(settingsKeyFor(session().profileId, session().id))
+                    setDebouncedDraft(session().profileId, session().id, event.currentTarget.value)
+                  }} onKeyDown={onComposerKeyDown}
                     onPaste={event => { const files = Array.from(event.clipboardData?.files || []); if (files.length) { event.preventDefault(); void uploadFiles(files) } }}
                     placeholder={isConnected() ? text.messagePlaceholder : text.reconnectToSend} disabled={!isConnected() || session().archived} rows={2} />
                   <div class="workspace-composer-actions">

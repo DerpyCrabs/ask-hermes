@@ -24,6 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
 type GatewaySocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type ScopeKey = (String, String);
+type IdleRuntime = (GatewaySocket, String, u64);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_FILE_DATA_URL_MAX_CHARS: usize = 24 * 1024 * 1024;
@@ -54,10 +55,17 @@ pub(crate) struct WorkspaceBackend {
     live_messages: Mutex<HashMap<ScopeKey, LiveMessage>>,
     interactions: Mutex<HashMap<(String, String, String), PendingInteraction>>,
     client_states: Mutex<HashMap<ScopeKey, SessionClientState>>,
+    // Hermes compression can replace the persisted session id while keeping
+    // the runtime alive. Accept late renderer mutations against the previous
+    // id and route them to the newest member of the lineage.
+    session_aliases: Mutex<HashMap<ScopeKey, ScopeKey>>,
     // Handoff orchestration lives in the persistent native backend rather than
     // either webview. A workspace renderer reload can therefore retry the same
     // handoff without creating a second destination session.
     handoff_destinations: AsyncMutex<HashMap<String, HandoffDestination>>,
+    // Hermes does not persist session.create before its first prompt. Preserve
+    // that transport until first send instead of resuming a nonexistent row.
+    idle_runtimes: AsyncMutex<HashMap<ScopeKey, IdleRuntime>>,
     applied_handoffs: Mutex<HashMap<ScopeKey, HashSet<String>>>,
     removed_queue_entries: Mutex<HashMap<ScopeKey, HashSet<String>>>,
     validated_contracts: Mutex<HashSet<ScopeKey>>,
@@ -106,7 +114,11 @@ impl WorkspaceBackend {
         if let Ok(mut values) = self.client_states.lock() {
             values.clear();
         }
+        if let Ok(mut values) = self.session_aliases.lock() {
+            values.clear();
+        }
         self.handoff_destinations.lock().await.clear();
+        self.idle_runtimes.lock().await.clear();
         if let Ok(mut values) = self.applied_handoffs.lock() {
             values.clear();
         }
@@ -2671,6 +2683,7 @@ pub(crate) async fn begin_instance_operation<'a>(
     Ok(operation)
 }
 
+#[allow(dead_code)]
 async fn begin_current_instance_operation(workspace: &WorkspaceBackend) -> RwLockReadGuard<'_, ()> {
     workspace.instance_operations.read().await
 }
@@ -2702,7 +2715,7 @@ fn capabilities(flags: CapabilityFlags) -> Value {
         "sessions": supported(true, "Session gateway APIs are unavailable"),
         "sessionSearch": supported(flags.search, "Gateway does not expose GET /api/sessions/search"),
         "sessionBranch": supported(flags.branch, "Gateway does not expose session.branch"),
-        "sessionPin": supported(false, "Gateway does not expose session pin mutation"),
+        "sessionPin": supported(true, "Session pinning is stored by the workspace client"),
         "sessionArchive": supported(flags.archive, "Gateway does not expose PATCH /api/sessions/{id}"),
         "sessionDelete": supported(flags.delete, "Gateway does not expose DELETE /api/sessions/{id}"),
         "attachments": supported(flags.attachments, "Gateway lacks image.attach_bytes/image.attach/image.detach or file.attach"),
@@ -2803,14 +2816,15 @@ fn map_profile_responses(profiles: &Value, active: &Value) -> Result<(Vec<Value>
 }
 
 fn active_list_row_is_active(row: &Value) -> bool {
-    // Current gateways expose an explicit `running` boolean. A newly-created
-    // idle session is `status: waiting, running: false`.
+    // Current gateways expose an explicit `running` boolean. `starting`
+    // without that boolean is only deferred agent hydration after
+    // session.create; no user turn exists yet.
     if let Some(running) = row.get("running").and_then(Value::as_bool) {
         return running;
     }
     matches!(
         row.get("status").and_then(Value::as_str),
-        Some("starting" | "waiting" | "working" | "running" | "stalled")
+        Some("waiting" | "working" | "running" | "stalled")
     )
 }
 
@@ -2938,7 +2952,20 @@ async fn reconcile_server_active(
         .lock()
         .map(|finalizing| finalizing.clone())
         .unwrap_or_default();
+    let mut settled_owned = Vec::new();
     if let Ok(mut owned) = backend.owned_active.lock() {
+        settled_owned.extend(owned.iter().filter_map(|key| {
+            (!retain_owned_during_reconcile(
+                key,
+                profile,
+                global_scope,
+                &active_keys,
+                &controlled,
+                &starting,
+                &finalizing,
+            ))
+            .then(|| key.clone())
+        }));
         owned.retain(|key| {
             retain_owned_during_reconcile(
                 key,
@@ -2950,6 +2977,23 @@ async fn reconcile_server_active(
                 &finalizing,
             )
         });
+    }
+    if !settled_owned.is_empty() {
+        if let Ok(mut pending) = backend.pending_sessions.lock() {
+            for key in &settled_owned {
+                pending.remove(key);
+            }
+        }
+        if let Ok(mut users) = backend.live_users.lock() {
+            for key in &settled_owned {
+                users.remove(key);
+            }
+        }
+        if let Ok(mut messages) = backend.live_messages.lock() {
+            for key in &settled_owned {
+                messages.remove(key);
+            }
+        }
     }
     if let Ok(mut active) = backend.server_active.lock() {
         if global_scope {
@@ -3574,28 +3618,23 @@ async fn http_method_supported(
         Ok(client) => client,
         Err(_) => return false,
     };
-    let mut request = client.request(Method::OPTIONS, format!("{}{}", connection.http_url, path));
+    // FastAPI/Starlette does not aggregate Allow across separately registered
+    // handlers for the same dynamic path. OPTIONS can therefore advertise GET
+    // while PATCH and DELETE are both valid. Probe the requested method against
+    // a guaranteed-missing session id: a handler-level 404 proves the route,
+    // while an unsupported method returns 405 without mutating anything.
+    let mut request = client.request(method.clone(), format!("{}{}", connection.http_url, path));
     if !connection.token.is_empty() {
         request = request.header("X-Hermes-Session-Token", &connection.token);
+    }
+    if method == Method::PATCH {
+        request = request.json(&json!({}));
     }
     let Ok(response) = request.send().await else {
         return false;
     };
-    if response.status().as_u16() == 404 {
-        return false;
-    }
-    let Some(allowed) = response
-        .headers()
-        .get(reqwest::header::ALLOW)
-        .and_then(|value| value.to_str().ok())
-    else {
-        // Legacy Hermes OPTIONS responses do not advertise Allow. Preserve
-        // route-level compatibility until server capability manifests exist.
-        return true;
-    };
-    allowed
-        .split(',')
-        .any(|allowed| allowed.trim().eq_ignore_ascii_case(method.as_str()))
+    response.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED
+        && response.status() != reqwest::StatusCode::NOT_IMPLEMENTED
 }
 
 async fn probe_optional_capabilities(
@@ -3981,7 +4020,7 @@ async fn session_summary_for(
     }
     let detail = match session_detail(connection, profile, session_id).await {
         Ok(detail) => detail,
-        Err(error)
+        Err(_error)
             if workspace
                 .runtimes
                 .lock()
@@ -4361,20 +4400,51 @@ pub(crate) async fn workspace_list_messages(
     let _instance_operation =
         begin_scoped_gateway_operation(&backend, &workspace, &request.instance).await?;
     let connection = connection_for(&backend, Some(&request.profile_id))?;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let pending = workspace
         .pending_sessions
         .lock()
         .map(|pending| pending.contains_key(&key))
         .unwrap_or(false);
-    if pending {
+    let pending_had_turn = workspace
+        .live_users
+        .lock()
+        .map(|users| users.contains_key(&key))
+        .unwrap_or(false);
+    if pending && (turn_is_active(&workspace, &key) || !pending_had_turn) {
         return Ok(json!({
             "messages": merge_live_snapshot(&workspace, &key, Vec::new()),
             "hasOlder": false
         }));
     }
     let limit = request.limit.clamp(1, 500);
-    let detail = session_detail(&connection, &request.profile_id, &request.session_id).await?;
+    let detail = match session_detail(&connection, &key.0, &key.1).await {
+        Ok(detail) => detail,
+        Err(_) if pending => {
+            return Ok(json!({
+                "messages": merge_live_snapshot(&workspace, &key, Vec::new()),
+                "hasOlder": false
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    if pending {
+        if let Ok(mut sessions) = workspace.pending_sessions.lock() {
+            sessions.remove(&key);
+        }
+        if let Ok(mut users) = workspace.live_users.lock() {
+            users.remove(&key);
+        }
+        if let Ok(mut messages) = workspace.live_messages.lock() {
+            messages.remove(&key);
+        }
+        if let Ok(mut owned) = workspace.owned_active.lock() {
+            owned.remove(&key);
+        }
+    }
     let count = detail
         .get("message_count")
         .and_then(Value::as_u64)
@@ -4403,14 +4473,7 @@ pub(crate) async fn workspace_list_messages(
             let mut scan_offset = 0;
             let mut found = false;
             'scan: while scan_offset < count {
-                let chunk = raw_messages(
-                    &connection,
-                    &request.profile_id,
-                    &request.session_id,
-                    500,
-                    scan_offset,
-                )
-                .await?;
+                let chunk = raw_messages(&connection, &key.0, &key.1, 500, scan_offset).await?;
                 for (index, row) in chunk.iter().enumerate() {
                     if message_id_matches(row, anchor) {
                         offset = (scan_offset + index).saturating_sub(limit / 2);
@@ -4430,15 +4493,8 @@ pub(crate) async fn workspace_list_messages(
         }
     }
 
-    let rows = raw_messages(
-        &connection,
-        &request.profile_id,
-        &request.session_id,
-        page_limit,
-        offset,
-    )
-    .await?;
-    let mut messages = map_messages(&rows, &request.profile_id, &request.session_id);
+    let rows = raw_messages(&connection, &key.0, &key.1, page_limit, offset).await?;
+    let mut messages = map_messages(&rows, &key.0, &key.1);
     apply_session_usage(&mut messages, &detail);
     let messages = merge_live_snapshot(&workspace, &key, messages);
     Ok(json!({
@@ -4958,7 +5014,7 @@ async fn create_gateway_session(
     settings: &TurnSettings,
     messages: Option<Vec<Value>>,
     parent_session_id: Option<&str>,
-) -> Result<(String, String), String> {
+) -> Result<(GatewaySocket, String, String, u64), String> {
     let mut params = json!({
         "source": "desktop",
         "profile": profile,
@@ -4975,7 +5031,10 @@ async fn create_gateway_session(
     if let Some(parent) = parent_session_id {
         params["parent_session_id"] = Value::String(parent.to_string());
     }
-    let result = rpc_once(connection, "session.create", params).await?;
+    let (mut socket, _) = connect_async(&connection.ws_url)
+        .await
+        .map_err(|error| format!("Could not connect to Hermes gateway: {error}"))?;
+    let result = rpc_on_socket(&mut socket, 1, "session.create", params).await?;
     validate_desktop_contract(&result)?;
     let runtime_id = result
         .get("session_id")
@@ -4988,7 +5047,7 @@ async fn create_gateway_session(
         .filter(|value| !value.is_empty())
         .unwrap_or(&runtime_id)
         .to_string();
-    Ok((runtime_id, stored_id))
+    Ok((socket, runtime_id, stored_id, 2))
 }
 
 #[tauri::command]
@@ -5002,9 +5061,14 @@ pub(crate) async fn workspace_create_session(
     let profile = profile_key(&request.profile_id);
     let settings = request.settings.unwrap_or_default();
     let connection = connection_for(&backend, Some(&profile))?;
-    let (runtime_id, stored_id) =
+    let (socket, runtime_id, stored_id, next_id) =
         create_gateway_session(&connection, &profile, &settings, None, None).await?;
     let key = (profile.clone(), stored_id.clone());
+    workspace
+        .idle_runtimes
+        .lock()
+        .await
+        .insert(key.clone(), (socket, runtime_id.clone(), next_id));
     workspace
         .runtimes
         .lock()
@@ -5066,7 +5130,7 @@ pub(crate) async fn workspace_resolve_handoff_destination(
 
     let settings = TurnSettings::default();
     let connection = connection_for(&backend, Some(&profile))?;
-    let (runtime_id, stored_id) =
+    let (socket, runtime_id, stored_id, next_id) =
         create_gateway_session(&connection, &profile, &settings, None, None).await?;
     let destination = HandoffDestination {
         profile_id: profile.clone(),
@@ -5079,6 +5143,11 @@ pub(crate) async fn workspace_resolve_handoff_destination(
     drop(destinations);
 
     let key = (profile, stored_id);
+    workspace
+        .idle_runtimes
+        .lock()
+        .await
+        .insert(key.clone(), (socket, runtime_id.clone(), next_id));
     workspace
         .runtimes
         .lock()
@@ -5108,7 +5177,10 @@ pub(crate) async fn workspace_session_action(
 ) -> Result<(), String> {
     let _instance_operation =
         begin_scoped_gateway_operation(&backend, &workspace, &request.instance).await?;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     if let SessionAction::Pin { pinned } = &request.action {
         let _ = pinned;
         return Err("Gateway does not expose session pin mutation".to_string());
@@ -5226,47 +5298,54 @@ pub(crate) async fn workspace_session_action(
 }
 
 fn clear_session_state(workspace: &WorkspaceBackend, key: &ScopeKey) {
+    let key = resolve_session_key(workspace, key.clone());
+    if let Ok(mut values) = workspace.idle_runtimes.try_lock() {
+        values.remove(&key);
+    }
     if let Ok(mut values) = workspace.pending_sessions.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.runtimes.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.starting.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.finalizing.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.controls.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.server_active.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.server_active_rows.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.owned_active.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.mirrored_active.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.live_users.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.live_messages.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.client_states.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.pins.lock() {
-        values.remove(key);
+        values.remove(&key);
     }
     if let Ok(mut values) = workspace.interactions.lock() {
         values.retain(|(profile, session, _), _| profile != &key.0 || session != &key.1);
+    }
+    if let Ok(mut values) = workspace.session_aliases.lock() {
+        values.retain(|previous, next| previous != &key && next != &key);
     }
 }
 
@@ -5453,7 +5532,7 @@ pub(crate) async fn workspace_branch_session(
                 })
             })
             .collect::<Vec<_>>();
-        let (runtime, stored) = create_gateway_session(
+        let (socket, runtime, stored, next_id) = create_gateway_session(
             &connection,
             &request.profile_id,
             &TurnSettings::default(),
@@ -5461,6 +5540,10 @@ pub(crate) async fn workspace_branch_session(
             Some(&request.session_id),
         )
         .await?;
+        workspace.idle_runtimes.lock().await.insert(
+            (request.profile_id.clone(), stored.clone()),
+            (socket, runtime.clone(), next_id),
+        );
         (runtime, stored, "Branched chat".to_string())
     } else {
         branch_whole_gateway_session(&connection, &request.profile_id, &request.session_id).await?
@@ -5538,10 +5621,16 @@ async fn open_runtime_socket_with_policy(
     stored_id: &str,
     resume_active_owned_turn: bool,
 ) -> Result<(GatewaySocket, String, u64, bool, Value), String> {
+    let key = (profile.to_string(), stored_id.to_string());
+    if !resume_active_owned_turn {
+        if let Some((socket, runtime, next_id)) = workspace.idle_runtimes.lock().await.remove(&key)
+        {
+            return Ok((socket, runtime, next_id, false, Value::Null));
+        }
+    }
     let (mut socket, _) = connect_async(&connection.ws_url)
         .await
         .map_err(|error| format!("Could not connect to Hermes gateway: {error}"))?;
-    let key = (profile.to_string(), stored_id.to_string());
     let active = rpc_on_socket(
         &mut socket,
         1,
@@ -5698,6 +5787,7 @@ pub(crate) async fn refresh_authoritative_active_work_locked(
 /// Holding the read side for the complete gateway/reconcile lifetime prevents
 /// an old-instance preflight from writing its activity into caches after an
 /// instance switch resets them.
+#[allow(dead_code)]
 pub(crate) async fn refresh_authoritative_active_work(app: &AppHandle) -> Result<bool, String> {
     let workspace = app.state::<WorkspaceBackend>();
     let _instance_operation = begin_current_instance_operation(&workspace).await;
@@ -6039,16 +6129,16 @@ pub(crate) fn mirror_prompt_event(
     payload: &Value,
 ) -> bool {
     let workspace = app.state::<WorkspaceBackend>();
-    let key = (profile.to_string(), stored_id.to_string());
+    let mut key = (profile.to_string(), stored_id.to_string());
     let mut live = workspace
         .live_messages
         .lock()
         .ok()
         .and_then(|messages| messages.get(&key).cloned())
         .unwrap_or_else(|| LiveMessage::new(profile, stored_id, "prompt-live"));
-    let finished = gateway_event(app, &workspace, &mut live, event_type, payload);
+    let finished = gateway_event(app, &workspace, &mut key, &mut live, event_type, payload);
     if finished {
-        mirror_prompt_ended(app, profile, stored_id, live.error.as_deref());
+        mirror_prompt_ended(app, &key.0, &key.1, live.error.as_deref());
     }
     finished
 }
@@ -6148,9 +6238,86 @@ fn cache_live_message(workspace: &WorkspaceBackend, message: &LiveMessage) {
     }
 }
 
+fn resolve_session_key(workspace: &WorkspaceBackend, key: ScopeKey) -> ScopeKey {
+    let Ok(aliases) = workspace.session_aliases.lock() else {
+        return key;
+    };
+    let mut resolved = key;
+    let mut visited = HashSet::new();
+    while visited.insert(resolved.clone()) {
+        let Some(next) = aliases.get(&resolved) else {
+            break;
+        };
+        resolved = next.clone();
+    }
+    resolved
+}
+
+fn move_map_value<T>(values: &Mutex<HashMap<ScopeKey, T>>, previous: &ScopeKey, next: &ScopeKey) {
+    if let Ok(mut values) = values.lock() {
+        if let Some(value) = values.remove(previous) {
+            values.entry(next.clone()).or_insert(value);
+        }
+    }
+}
+
+fn move_set_value(values: &Mutex<HashSet<ScopeKey>>, previous: &ScopeKey, next: &ScopeKey) {
+    if let Ok(mut values) = values.lock() {
+        if values.remove(previous) {
+            values.insert(next.clone());
+        }
+    }
+}
+
+fn rotate_session_scope(workspace: &WorkspaceBackend, previous: &ScopeKey, next: &ScopeKey) {
+    if previous == next {
+        return;
+    }
+    if let Ok(mut aliases) = workspace.session_aliases.lock() {
+        for destination in aliases.values_mut() {
+            if destination == previous {
+                *destination = next.clone();
+            }
+        }
+        aliases.insert(previous.clone(), next.clone());
+    }
+    move_map_value(&workspace.runtimes, previous, next);
+    move_map_value(&workspace.pending_sessions, previous, next);
+    move_map_value(&workspace.controls, previous, next);
+    move_map_value(&workspace.server_active_rows, previous, next);
+    move_map_value(&workspace.live_users, previous, next);
+    move_map_value(&workspace.live_messages, previous, next);
+    move_map_value(&workspace.client_states, previous, next);
+    move_map_value(&workspace.applied_handoffs, previous, next);
+    move_map_value(&workspace.removed_queue_entries, previous, next);
+    move_set_value(&workspace.starting, previous, next);
+    move_set_value(&workspace.finalizing, previous, next);
+    move_set_value(&workspace.server_active, previous, next);
+    move_set_value(&workspace.owned_active, previous, next);
+    move_set_value(&workspace.mirrored_active, previous, next);
+    move_set_value(&workspace.validated_contracts, previous, next);
+    move_set_value(&workspace.pins, previous, next);
+    if let Ok(mut interactions) = workspace.interactions.lock() {
+        let keys = interactions
+            .keys()
+            .filter(|(profile, session, _)| profile == &previous.0 && session == &previous.1)
+            .cloned()
+            .collect::<Vec<_>>();
+        for old_key in keys {
+            let Some(interaction) = interactions.remove(&old_key) else {
+                continue;
+            };
+            interactions
+                .entry((next.0.clone(), next.1.clone(), old_key.2))
+                .or_insert(interaction);
+        }
+    }
+}
+
 fn gateway_event(
     app: &AppHandle,
     workspace: &WorkspaceBackend,
+    key: &mut ScopeKey,
     message: &mut LiveMessage,
     event_type: &str,
     payload: &Value,
@@ -6387,7 +6554,26 @@ fn gateway_event(
             );
         }
         "session.info" => {
-            let key = (message.profile.clone(), message.session_id.clone());
+            if let Some(stored_session_id) = payload
+                .get("stored_session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && *value != key.1)
+            {
+                let previous = key.clone();
+                let next = (key.0.clone(), stored_session_id.to_string());
+                rotate_session_scope(workspace, &previous, &next);
+                *key = next.clone();
+                message.session_id = next.1.clone();
+                workspace_event(
+                    app,
+                    json!({
+                        "type": "session-rotate",
+                        "profileId": next.0,
+                        "previousSessionId": previous.1,
+                        "sessionId": next.1,
+                    }),
+                );
+            }
             let settings = turn_settings_from_row(payload);
             if let Ok(mut rows) = workspace.server_active_rows.lock() {
                 let row = rows.entry(key.clone()).or_insert_with(|| {
@@ -6494,7 +6680,7 @@ fn gateway_event(
 async fn stream_turn(
     app: AppHandle,
     mut socket: GatewaySocket,
-    key: ScopeKey,
+    mut key: ScopeKey,
     runtime_id: String,
     mut next_id: u64,
     prompt_request_id: u64,
@@ -6590,7 +6776,7 @@ async fn stream_turn(
                     }
                     continue;
                 }
-                finished = gateway_event(&app, &workspace, &mut live_message, event_type, payload);
+                finished = gateway_event(&app, &workspace, &mut key, &mut live_message, event_type, payload);
             }
         }
     }
@@ -6735,7 +6921,9 @@ async fn begin_turn(
     entry: QueueEntry,
     truncate_ordinal: Option<usize>,
 ) -> Result<(), String> {
-    let key = (profile.clone(), session_id.clone());
+    let key = resolve_session_key(workspace, (profile, session_id));
+    let profile = key.0.clone();
+    let session_id = key.1.clone();
     {
         let mut starting = workspace
             .starting
@@ -6946,7 +7134,10 @@ pub(crate) async fn workspace_steer_turn(
     if text.is_empty() {
         return Err("Steer text cannot be empty".to_string());
     }
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let result = if let Some(result) =
         control_request(&workspace, &key, "session.steer", json!({ "text": text })).await
     {
@@ -6999,7 +7190,10 @@ pub(crate) async fn workspace_execute_slash(
             "/{name} is outside the Ask Hermes workspace command surface"
         ));
     }
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     if let Some(primary) = control_request(
         &workspace,
         &key,
@@ -7042,13 +7236,8 @@ pub(crate) async fn workspace_execute_slash(
         };
     }
 
-    let (mut socket, runtime, mut id, _, _) = open_runtime_socket(
-        &connection,
-        &workspace,
-        &request.profile_id,
-        &request.session_id,
-    )
-    .await?;
+    let (mut socket, runtime, mut id, _, _) =
+        open_runtime_socket(&connection, &workspace, &key.0, &key.1).await?;
     id += 1;
     match rpc_on_socket(
         &mut socket,
@@ -7082,13 +7271,16 @@ pub(crate) async fn workspace_stop_turn(
 ) -> Result<(), String> {
     let _instance_operation =
         begin_scoped_gateway_operation(&backend, &workspace, &request.instance).await?;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     if !turn_is_active(&workspace, &key) {
         return Ok(());
     }
     workspace_event(
         &app,
-        json!({ "type": "turn-state", "profileId": request.profile_id, "sessionId": request.session_id, "state": "stopping" }),
+        json!({ "type": "turn-state", "profileId": key.0, "sessionId": key.1, "state": "stopping" }),
     );
     if let Some(result) = control_request(&workspace, &key, "session.interrupt", json!({})).await {
         result?;
@@ -7103,13 +7295,8 @@ pub(crate) async fn workspace_stop_turn(
         )
         .await
     } else {
-        let (mut socket, runtime, mut id, _, _) = open_runtime_socket(
-            &connection,
-            &workspace,
-            &request.profile_id,
-            &request.session_id,
-        )
-        .await?;
+        let (mut socket, runtime, mut id, _, _) =
+            open_runtime_socket(&connection, &workspace, &key.0, &key.1).await?;
         id += 1;
         rpc_on_socket(
             &mut socket,
@@ -7130,8 +7317,8 @@ pub(crate) async fn workspace_stop_turn(
             workspace_event(
                 &app,
                 json!({
-                    "type": "turn-state", "profileId": request.profile_id,
-                    "sessionId": request.session_id, "state": "idle",
+                    "type": "turn-state", "profileId": key.0,
+                    "sessionId": key.1, "state": "idle",
                 }),
             );
             recompute_active_work(&app, &workspace);
@@ -7141,8 +7328,8 @@ pub(crate) async fn workspace_stop_turn(
             workspace_event(
                 &app,
                 json!({
-                    "type": "turn-state", "profileId": request.profile_id,
-                    "sessionId": request.session_id, "state": "error", "error": error,
+                    "type": "turn-state", "profileId": key.0,
+                    "sessionId": key.1, "state": "error", "error": error,
                 }),
             );
             Err(error)
@@ -7272,18 +7459,16 @@ pub(crate) async fn workspace_undo(
 ) -> Result<(), String> {
     let _instance_operation =
         begin_scoped_gateway_operation(&backend, &workspace, &request.instance).await?;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     if turn_is_active(&workspace, &key) {
         return Err("Stop the active turn before undoing".to_string());
     }
     let connection = connection_for(&backend, Some(&request.profile_id))?;
-    let (mut socket, runtime, mut id, running, _) = open_runtime_socket(
-        &connection,
-        &workspace,
-        &request.profile_id,
-        &request.session_id,
-    )
-    .await?;
+    let (mut socket, runtime, mut id, running, _) =
+        open_runtime_socket(&connection, &workspace, &key.0, &key.1).await?;
     if running {
         return Err("Stop the active turn before undoing".to_string());
     }
@@ -7309,14 +7494,13 @@ pub(crate) async fn workspace_submit_interaction(
 ) -> Result<(), String> {
     let _instance_operation =
         begin_scoped_gateway_operation(&backend, &workspace, &request.instance).await?;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let interaction = workspace.interactions.lock().ok().and_then(|interactions| {
         interactions
-            .get(&(
-                request.profile_id.clone(),
-                request.session_id.clone(),
-                request.interaction_id.clone(),
-            ))
+            .get(&(key.0.clone(), key.1.clone(), request.interaction_id.clone()))
             .cloned()
     });
     let (method, params) = match interaction {
@@ -7364,13 +7548,8 @@ pub(crate) async fn workspace_submit_interaction(
             params["session_id"] = Value::String(runtime);
             rpc_once(&connection, method, params).await?;
         } else {
-            let (mut socket, runtime, mut id, _, _) = open_runtime_socket(
-                &connection,
-                &workspace,
-                &request.profile_id,
-                &request.session_id,
-            )
-            .await?;
+            let (mut socket, runtime, mut id, _, _) =
+                open_runtime_socket(&connection, &workspace, &key.0, &key.1).await?;
             id += 1;
             let mut params = params;
             params["session_id"] = Value::String(runtime);
@@ -7378,11 +7557,7 @@ pub(crate) async fn workspace_submit_interaction(
         }
     }
     if let Ok(mut interactions) = workspace.interactions.lock() {
-        interactions.remove(&(
-            request.profile_id.clone(),
-            request.session_id.clone(),
-            request.interaction_id.clone(),
-        ));
+        interactions.remove(&(key.0.clone(), key.1.clone(), request.interaction_id.clone()));
     }
     if let Ok(mut messages) = workspace.live_messages.lock() {
         if let Some(message) = messages.get_mut(&key) {
@@ -7492,7 +7667,10 @@ async fn workspace_upload_attachment_inner(
     if size > 16 * 1024 * 1024 {
         return Err("Attachment exceeds the 16 MB workspace limit".to_string());
     }
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let result = if workspace
         .controls
         .lock()
@@ -7558,13 +7736,8 @@ async fn workspace_upload_attachment_inner(
         result
     } else {
         let connection = connection_for(backend, Some(&request.profile_id))?;
-        let (mut socket, runtime, mut id, _, _) = open_runtime_socket(
-            &connection,
-            workspace,
-            &request.profile_id,
-            &request.session_id,
-        )
-        .await?;
+        let (mut socket, runtime, mut id, _, _) =
+            open_runtime_socket(&connection, workspace, &key.0, &key.1).await?;
         id += 1;
         let result = upload_via_socket(
             &mut socket,
@@ -8268,7 +8441,10 @@ pub(crate) fn workspace_sync_client_state(
     }
     let instance_id = configured_instance_id(&backend_guard.config);
     let instance_generation = backend_guard.generation;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let removed_queue_entries = workspace
         .removed_queue_entries
         .lock()
@@ -8281,7 +8457,7 @@ pub(crate) fn workspace_sync_client_state(
             .client_states
             .lock()
             .map_err(|_| "Workspace client state is unavailable")?;
-        let state = states.entry(key).or_default();
+        let state = states.entry(key.clone()).or_default();
         *state = corrected_recovery_client_state(
             &request.state,
             state,
@@ -8296,8 +8472,8 @@ pub(crate) fn workspace_sync_client_state(
         &app,
         &instance_id,
         instance_generation,
-        &request.profile_id,
-        &request.session_id,
+        &key.0,
+        &key.1,
         &state,
         None,
     );
@@ -8327,7 +8503,10 @@ pub(crate) fn workspace_mutate_client_state(
     }
     let instance_id = configured_instance_id(&backend_guard.config);
     let instance_generation = backend_guard.generation;
-    let key = (request.profile_id.clone(), request.session_id.clone());
+    let key = resolve_session_key(
+        &workspace,
+        (request.profile_id.clone(), request.session_id.clone()),
+    );
     let handoff_id = match &request.mutation {
         ClientStateMutation::ApplyHandoff { handoff_id, .. } => Some(handoff_id.clone()),
         _ => None,
@@ -8355,7 +8534,10 @@ pub(crate) fn workspace_mutate_client_state(
         if !already_applied {
             apply_client_state_mutation(state, request.mutation);
             if let Some(handoff_id) = handoff_id {
-                applied_handoffs.entry(key).or_default().insert(handoff_id);
+                applied_handoffs
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(handoff_id);
             }
         }
         state.clone()
@@ -8366,8 +8548,8 @@ pub(crate) fn workspace_mutate_client_state(
         &app,
         &instance_id,
         instance_generation,
-        &request.profile_id,
-        &request.session_id,
+        &key.0,
+        &key.1,
         &state,
         Some(&request.client_id),
     );
@@ -8392,7 +8574,7 @@ pub(crate) fn workspace_get_client_state(
     ) {
         return Err("Client state belongs to a stale Hermes instance generation".to_string());
     }
-    let key = (request.profile_id, request.session_id);
+    let key = resolve_session_key(&workspace, (request.profile_id, request.session_id));
     workspace
         .client_states
         .lock()
@@ -8536,6 +8718,72 @@ mod tests {
         assert!(!client_state_scope_matches(&config, 5, "instance-a", 4));
         config.instance_id = "instance-a".to_string();
         assert!(!client_state_scope_matches(&config, 6, "instance-a", 4));
+    }
+
+    #[test]
+    fn compression_rotation_moves_native_scope_and_keeps_old_ids_as_aliases() {
+        let workspace = WorkspaceBackend::default();
+        let first = ("default".to_string(), "stored-1".to_string());
+        let second = ("default".to_string(), "stored-2".to_string());
+        let third = ("default".to_string(), "stored-3".to_string());
+        workspace
+            .runtimes
+            .lock()
+            .unwrap()
+            .insert(first.clone(), "runtime".to_string());
+        workspace.client_states.lock().unwrap().insert(
+            first.clone(),
+            SessionClientState {
+                draft: "keep me".to_string(),
+                ..SessionClientState::default()
+            },
+        );
+        workspace
+            .server_active
+            .lock()
+            .unwrap()
+            .insert(first.clone());
+        workspace.interactions.lock().unwrap().insert(
+            (first.0.clone(), first.1.clone(), "approval".to_string()),
+            PendingInteraction::Approval,
+        );
+
+        rotate_session_scope(&workspace, &first, &second);
+        rotate_session_scope(&workspace, &second, &third);
+
+        assert_eq!(
+            resolve_session_key(&workspace, first.clone()),
+            third.clone()
+        );
+        assert_eq!(
+            resolve_session_key(&workspace, second.clone()),
+            third.clone()
+        );
+        assert_eq!(
+            workspace
+                .runtimes
+                .lock()
+                .unwrap()
+                .get(&third)
+                .map(String::as_str),
+            Some("runtime")
+        );
+        assert_eq!(
+            workspace
+                .client_states
+                .lock()
+                .unwrap()
+                .get(&third)
+                .map(|state| state.draft.as_str()),
+            Some("keep me")
+        );
+        assert!(workspace.server_active.lock().unwrap().contains(&third));
+        assert!(workspace.interactions.lock().unwrap().contains_key(&(
+            third.0.clone(),
+            third.1.clone(),
+            "approval".to_string()
+        )));
+        assert!(!workspace.runtimes.lock().unwrap().contains_key(&first));
     }
 
     #[tokio::test]
@@ -9272,9 +9520,10 @@ mod tests {
 
     #[test]
     fn active_list_contract_keeps_builds_and_interactions_busy() {
-        for status in ["starting", "waiting", "working", "running", "stalled"] {
+        for status in ["waiting", "working", "running", "stalled"] {
             assert!(active_list_row_is_active(&json!({ "status": status })));
         }
+        assert!(!active_list_row_is_active(&json!({ "status": "starting" })));
         assert!(active_list_row_is_active(&json!({
             "status": "idle",
             "running": true,
@@ -9814,7 +10063,7 @@ mod tests {
                 .contains("mock failure")
         );
 
-        let (runtime, stored) =
+        let (_socket, runtime, stored, _next_id) =
             create_gateway_session(&connection, "default", &TurnSettings::default(), None, None)
                 .await
                 .unwrap();

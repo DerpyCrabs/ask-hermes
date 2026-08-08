@@ -13,6 +13,16 @@ export function notificationEnabled(preferences: WorkspaceNotificationPreference
   return preferences[kind]
 }
 
+export function shouldSendNativeNotification(
+  kind: WorkspaceNotificationKind,
+  anyWindowFocused: boolean,
+  targetChatSelected: boolean,
+) {
+  if (!anyWindowFocused) return true
+  if (kind === 'turnCompletion' || kind === 'interactionRequired') return !targetChatSelected
+  return false
+}
+
 export function schedulesNeedBackgroundPolling(preferences: WorkspaceNotificationPreferences) {
   return preferences.scheduleFailure || preferences.scheduleCompletion
 }

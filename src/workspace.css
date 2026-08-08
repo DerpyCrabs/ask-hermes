@@ -159,6 +159,10 @@ html.workspace-document body { background: var(--ws-bg); color: var(--ws-text); 
 .workspace-rich-details > summary { padding: 6px 8px; cursor: pointer; }
 .workspace-rich-details > summary span { float: right; color: var(--ws-faint); }
 .workspace-rich-details > pre { max-height: 320px; margin: 0 6px 6px; overflow: auto; white-space: pre-wrap; }
+.workspace-usage dl { margin: 0 8px 8px; }
+.workspace-usage dl > div { display: flex; justify-content: space-between; gap: 16px; padding-top: 4px; }
+.workspace-usage dt { color: var(--ws-muted); }
+.workspace-usage dd { margin: 0; color: var(--ws-text); font-variant-numeric: tabular-nums; }
 .workspace-todos ul { display: grid; gap: 5px; margin: 0; padding: 0 9px 8px; list-style: none; }
 .workspace-todos li { display: grid; grid-template-columns: 14px 1fr auto; gap: 5px; align-items: start; color: var(--ws-text); }
 .workspace-todos li small { color: var(--ws-faint); text-transform: uppercase; }

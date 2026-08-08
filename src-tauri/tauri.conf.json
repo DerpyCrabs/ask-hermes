@@ -62,6 +62,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "icon": ["icons/hermes-tray-source.png", "icons/icon.ico"],
     "shortDescription": "Ask Hermes from anywhere",
     "longDescription": "A fast global prompt window for Hermes Agent with screen-region capture.",
     "windows": {

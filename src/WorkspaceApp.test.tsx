@@ -140,7 +140,7 @@ describe('rich historical message rendering', () => {
     expect(read).not.toHaveBeenCalled()
   })
 
-  it('keeps rich message details compact without rendering token usage', () => {
+  it('keeps rich message details compact and renders token/context usage', () => {
     const { root } = mountMessage({
       id: 'assistant-1',
       sessionId: 'session-1',
@@ -172,9 +172,89 @@ describe('rich historical message rendering', () => {
     expect(root.querySelector('.workspace-reasoning')?.textContent).toContain('Checked source material.')
     expect(root.querySelector('.workspace-artifacts')?.textContent).toContain('/tmp/report.pdf')
     expect(root.querySelectorAll('.workspace-artifacts a')).toHaveLength(1)
+    const usage = root.querySelector('.workspace-usage')
+    expect(usage?.textContent).toContain('Token usage')
+    expect(usage?.textContent).toContain('150 tokens')
+    expect(usage?.textContent).toContain('Message input120')
+    expect(usage?.textContent).toContain('Message output30')
+    expect(usage?.textContent).toContain('Session context400 / 1,000 (40%)')
+  })
+
+  it('uses session context and legacy total token fields when provided', () => {
+    const { root } = mountMessage({
+      id: 'assistant-usage',
+      sessionId: 'session-1',
+      profileId: 'default',
+      role: 'assistant',
+      content: 'Done.',
+      createdAt: '2026-07-22T12:00:00Z',
+      status: 'complete',
+      totalTokens: 75,
+      contextTokens: 600,
+      sessionUsage: { scope: 'session', totalTokens: 900, contextTokens: 800, contextMaxTokens: 2000, costUsd: 0.0123 },
+    })
+
+    const usage = root.querySelector('.workspace-usage')
+    expect(usage?.textContent).toContain('75 tokens')
+    expect(usage?.textContent).toContain('Message total75')
+    expect(usage?.textContent).not.toContain('Session total900')
+    expect(usage?.textContent).toContain('Session context800 / 2,000 (40%)')
+    expect(usage?.textContent).toContain('estimated cost$0.0123')
+  })
+
+  it('shows the session total when Hermes history has no per-message token total', () => {
+    const { root } = mountMessage({
+      id: 'assistant-session-usage',
+      sessionId: 'session-1',
+      profileId: 'default',
+      role: 'assistant',
+      content: 'Done.',
+      createdAt: '2026-07-22T12:00:00Z',
+      status: 'complete',
+      sessionUsage: { scope: 'session', totalTokens: 16, inputTokens: 12, outputTokens: 4 },
+    })
+
+    expect(root.querySelector('.workspace-usage')?.textContent).toContain('16 tokens')
+    expect(root.querySelector('.workspace-usage')?.textContent).toContain('Session total16')
+  })
+
+  it('ignores nullable Hermes usage fields instead of aborting message rendering', () => {
+    const sessionUsage = {
+      scope: 'session', totalTokens: 16, inputTokens: 12, outputTokens: 4,
+      contextTokens: null, contextMaxTokens: null, costUsd: null,
+    } as unknown as NonNullable<WorkspaceMessage['sessionUsage']>
+    const { root } = mountMessage({
+      id: 'assistant-null-usage',
+      sessionId: 'session-1',
+      profileId: 'default',
+      role: 'assistant',
+      content: 'E2E_TEXT_OK',
+      createdAt: '2026-07-22T12:00:00Z',
+      status: 'complete',
+      totalTokens: null as unknown as undefined,
+      contextTokens: null as unknown as undefined,
+      sessionUsage,
+    })
+
+    expect(root.textContent).toContain('E2E_TEXT_OK')
+    expect(root.querySelector('.workspace-usage')?.textContent).toContain('16 tokens')
+    expect(root.querySelector('.workspace-usage')?.textContent).not.toContain('estimated cost')
+  })
+
+  it('does not render an empty usage disclosure for nullable legacy fields', () => {
+    const { root } = mountMessage({
+      id: 'user-null-usage',
+      sessionId: 'session-1',
+      profileId: 'default',
+      role: 'user',
+      content: 'Question',
+      createdAt: '2026-07-22T12:00:00Z',
+      status: 'complete',
+      totalTokens: null as unknown as undefined,
+      contextTokens: null as unknown as undefined,
+    })
+
     expect(root.querySelector('.workspace-usage')).toBeNull()
-    expect(root.textContent).not.toContain('150 total')
-    expect(root.textContent).not.toContain('400 context')
   })
 
   it('renders recorded and pending historical interactions without dead response controls', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ATTACHMENT_ONLY_PROMPT, applyClientStateMutation, capability, clientStateGenerationMatches, composerHasSubmission, composerSubmissionText, hasBlockingWork, hasClientStateContent, lifecycleMutationBlockReason, mergeClientState, mergeSessionPage, moveQueueEntry, overlayPendingDraft, queueDrainTransition, reduceCollections, reduceMessages, safeExternalUrl, shouldAppendHandoffDraft, topLevelSessions, unavailableSessionSummary } from './state'
+import { ATTACHMENT_ONLY_PROMPT, applyClientStateMutation, capability, clientStateGenerationMatches, composerHasSubmission, composerSubmissionText, hasBlockingWork, hasClientStateContent, lifecycleMutationBlockReason, mergeClientState, mergeSessionPage, moveQueueEntry, overlayPendingDraft, queueDrainTransition, reconcileTranscriptPage, reduceCollections, reduceMessages, rotateChatSelection, safeExternalUrl, shouldAppendHandoffDraft, topLevelSessions, transcriptNeedsReconciliation, unavailableSessionSummary } from './state'
 import type { QueueEntry, SessionClientState, SessionSummary, WorkspaceMessage } from './types'
 
 const session = (overrides: Partial<SessionSummary> = {}): SessionSummary => ({
@@ -161,6 +161,34 @@ describe('workspace state helpers', () => {
     expect(message.content).toBe('Hi')
   })
 
+  it('moves a compressed chat and transcript to its rotated stored id', () => {
+    const event = {
+      type: 'session-rotate' as const,
+      profileId: 'p1',
+      previousSessionId: 's1',
+      sessionId: 's2',
+    }
+    const collections = reduceCollections({ sessions: [session()], schedules: [] }, event)
+    const message: WorkspaceMessage = {
+      id: 'm1', sessionId: 's1', profileId: 'p1', role: 'assistant', content: 'Still here',
+      createdAt: '2026-01-01T00:00:00Z', status: 'streaming',
+    }
+    const changed = reduceMessages([message], event, 'p1', 's1')
+
+    expect(collections.sessions[0].id).toBe('s2')
+    expect(changed[0].sessionId).toBe('s2')
+    expect(message.sessionId).toBe('s1')
+  })
+
+  it('follows only the foreground predecessor when compression rotates an id', () => {
+    const selected = { kind: 'chat' as const, profileId: 'p1', id: 's1', aroundMessageId: 'm1' }
+    expect(rotateChatSelection(selected, 'p1', 's1', 's2')).toEqual({
+      ...selected, id: 's2',
+    })
+    expect(rotateChatSelection(selected, 'p1', 'background', 's3')).toBe(selected)
+    expect(rotateChatSelection(selected, 'other', 's1', 's3')).toBe(selected)
+  })
+
   it('explains absent capabilities', () => {
     expect(capability(undefined, 'schedules')).toEqual({ supported: false, reason: 'Hermes did not report schedules support' })
   })
@@ -206,5 +234,31 @@ describe('workspace state helpers', () => {
     const current = session({ id: 'current', title: 'Old title' })
     const refreshed = session({ id: 'current', title: 'New title' })
     expect(mergeSessionPage([current, older], [refreshed])).toEqual([refreshed, older])
+  })
+
+  it('reconciles until a substantive assistant follows the latest user', () => {
+    const base = {
+      sessionId: 's', profileId: 'default', createdAt: '2026-07-24T00:00:00Z', status: 'complete' as const,
+    }
+    const user = { ...base, id: 'u', role: 'user' as const, content: 'question' }
+    const empty = { ...base, id: 'a0', role: 'assistant' as const, content: '' }
+    const answer = { ...base, id: 'a1', role: 'assistant' as const, content: 'answer' }
+    expect(transcriptNeedsReconciliation([user])).toBe(true)
+    expect(transcriptNeedsReconciliation([user, empty])).toBe(true)
+    expect(transcriptNeedsReconciliation([user, answer])).toBe(false)
+    expect(transcriptNeedsReconciliation([answer])).toBe(false)
+  })
+
+  it('accepts recovered answers but rejects late optimistic-page rollback', () => {
+    const base = {
+      sessionId: 's', profileId: 'default', createdAt: '2026-07-24T00:00:00Z',
+    }
+    const user = { ...base, id: 'u', role: 'user' as const, content: 'go', status: 'complete' as const }
+    const streaming = { ...base, id: 'as', role: 'assistant' as const, content: 'work', status: 'streaming' as const }
+    const answer = { ...streaming, id: 'ac', content: 'done', status: 'complete' as const }
+
+    expect(reconcileTranscriptPage([user], [user, answer])).toEqual([user, answer])
+    expect(reconcileTranscriptPage([user, answer], [user])).toEqual([user, answer])
+    expect(reconcileTranscriptPage([user, streaming], [user])).toEqual([user, streaming])
   })
 })
