@@ -7,8 +7,10 @@ const escapeHtml = (value: string) => value
 
 export function renderMarkdown(value: string): string {
   const rendered = marked.parse(escapeHtml(value), { async: false, breaks: true }) as string
-  return rendered.replace(/href="([^"]*)"/gi, (attribute, href: string) => {
-    if (!/^(https?:|mailto:)/i.test(href)) return ''
-    return `${attribute} target="_blank" rel="noreferrer noopener"`
-  })
+  return rendered
+    .replace(/href="([^"]*)"/gi, (attribute, href: string) => {
+      if (!/^(https?:|mailto:)/i.test(href)) return ''
+      return `${attribute} target="_blank" rel="noreferrer noopener"`
+    })
+    .replace(/src="([^"]*)"/gi, (attribute, src: string) => /^(https?:|data:image\/)/i.test(src) ? attribute : '')
 }
