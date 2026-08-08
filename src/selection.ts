@@ -9,6 +9,10 @@ export function normalizeSelection(remembered: string, sessions: SessionChoice[]
   return NEW_SESSION
 }
 
+export function sessionPreferenceForRouting(preference: string, sessionsValidated: boolean) {
+  return sessionsValidated ? preference : NEW_SESSION
+}
+
 export function newSessionSetting<T>(activeSession: string, value: T): T | null {
   return activeSession === NEW_SESSION ? value : null
 }

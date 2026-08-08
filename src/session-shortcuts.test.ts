@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { shortcutFromKeyboardEvent, transcriptFromMessages } from './session-shortcuts'
+import { shortcutFromKeyboardEvent, shortcutTextsMatch, shouldPreserveSessionShortcutContext, transcriptFromMessages } from './session-shortcuts'
 
 describe('session shortcuts', () => {
   it('formats modified keys for the native shortcut parser', () => {
@@ -14,6 +14,18 @@ describe('session shortcuts', () => {
   it('rejects bare keys and modifier-only input', () => {
     expect(shortcutFromKeyboardEvent({ key: 'h', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false })).toBeUndefined()
     expect(shortcutFromKeyboardEvent({ key: 'Control', ctrlKey: true, altKey: false, shiftKey: false, metaKey: false })).toBeUndefined()
+  })
+
+  it('preserves meaningful state only when reopening the same session', () => {
+    expect(shouldPreserveSessionShortcutContext('session-1', 'session-1', true)).toBe(true)
+    expect(shouldPreserveSessionShortcutContext('session-1', 'session-2', true)).toBe(false)
+    expect(shouldPreserveSessionShortcutContext('session-1', 'session-1', false)).toBe(false)
+  })
+
+  it('matches equivalent shortcut text independent of modifier order and case', () => {
+    expect(shortcutTextsMatch('Alt+Space', 'space + ALT')).toBe(true)
+    expect(shortcutTextsMatch('Ctrl+Alt+H', 'Alt+Ctrl+H')).toBe(true)
+    expect(shortcutTextsMatch('Alt+Space', 'Ctrl+Space')).toBe(false)
   })
 
   it('builds a complete chat transcript from stored messages', () => {

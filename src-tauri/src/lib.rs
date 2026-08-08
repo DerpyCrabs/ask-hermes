@@ -8,14 +8,18 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
+    future::Future,
     io::{BufRead, BufReader, Cursor, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 use tauri::{
     image::Image,
@@ -24,6 +28,8 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tokio::sync::watch;
+use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[cfg(windows)]
@@ -50,6 +56,11 @@ struct HermesBackendProcess {
     connection: HermesGatewayConnection,
     #[cfg(windows)]
     _job: WindowsKillJob,
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +119,23 @@ struct VoiceTranscription {
 const SPEACHES_MODEL: &str = "deepdml/faster-whisper-large-v3-turbo-ct2";
 const SETTINGS_CONFIG_FILE: &str = "settings.json";
 const SETTINGS_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+const DEFAULT_SETTINGS_PROFILE_KEY: &str = "default-v1";
+const CUSTOM_SETTINGS_PROFILE_KEY_PREFIX: &str = "custom-v1-";
+const DEFAULT_PROMPT_SHORTCUT: &str = "Alt+Space";
+const PROMPT_SHORTCUT_CONFIG_FILE: &str = "prompt-shortcut.json";
+const PROMPT_SHORTCUT_SETTING_KEY: &str = "ask-hermes.prompt-shortcut.v1";
+const TRAY_ICON_ID: &str = "ask-hermes-tray";
+const HERMES_TURN_CANCELLED: &str = "HERMES_TURN_CANCELLED";
+const HERMES_CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+const HERMES_CANCEL_TOMBSTONE_LIMIT: usize = 256;
+const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const HERMES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HERMES_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const HERMES_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
+const HERMES_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const HERMES_TURN_OVERALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const RESERVED_APP_SHORTCUTS: [(&str, &str); 2] =
+    [("Ctrl+Shift+D", "voice input"), ("Ctrl+N", "New Chat")];
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,15 +173,178 @@ struct HermesBackendState {
 }
 
 #[derive(Default)]
-struct HermesBackend(Mutex<HermesBackendState>);
+struct HermesBackendInner {
+    state: Mutex<HermesBackendState>,
+}
 
-impl Drop for HermesBackend {
+impl Drop for HermesBackendInner {
     fn drop(&mut self) {
-        if let Ok(state) = self.0.get_mut() {
+        if let Ok(state) = self.state.get_mut() {
             if let Some(process) = state.process.as_mut() {
-                let _ = process.child.kill();
+                terminate_child(&mut process.child);
             }
         }
+    }
+}
+
+#[derive(Clone, Default)]
+struct HermesBackend(Arc<HermesBackendInner>);
+
+#[derive(Clone)]
+struct TurnCancelHandle {
+    cancelled: Arc<AtomicBool>,
+    sender: watch::Sender<bool>,
+}
+
+impl TurnCancelHandle {
+    fn new() -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (
+            Self {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                sender,
+            },
+            receiver,
+        )
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.sender.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+struct ActiveHermesTurn {
+    id: u64,
+    cancel: TurnCancelHandle,
+}
+
+#[derive(Default)]
+struct ActiveHermesTurnsState {
+    turns: HashMap<String, ActiveHermesTurn>,
+    pending_cancellations: HashMap<String, StdInstant>,
+}
+
+#[derive(Default)]
+struct ActiveHermesTurnsInner {
+    state: Mutex<ActiveHermesTurnsState>,
+    next_id: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+struct ActiveHermesTurns(Arc<ActiveHermesTurnsInner>);
+
+struct ActiveHermesTurnGuard {
+    exchange_id: String,
+    id: u64,
+    turns: ActiveHermesTurns,
+}
+
+impl Drop for ActiveHermesTurnGuard {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.turns.0.state.lock() else {
+            return;
+        };
+        if state
+            .turns
+            .get(&self.exchange_id)
+            .is_some_and(|turn| turn.id == self.id)
+        {
+            state.turns.remove(&self.exchange_id);
+        }
+    }
+}
+
+fn prune_turn_cancel_tombstones(state: &mut ActiveHermesTurnsState, now: StdInstant) {
+    state.pending_cancellations.retain(|_, created_at| {
+        now.saturating_duration_since(*created_at) < HERMES_CANCEL_TOMBSTONE_TTL
+    });
+}
+
+fn record_turn_cancel_tombstone(
+    state: &mut ActiveHermesTurnsState,
+    exchange_id: &str,
+    now: StdInstant,
+) {
+    prune_turn_cancel_tombstones(state, now);
+    if !state.pending_cancellations.contains_key(exchange_id)
+        && state.pending_cancellations.len() >= HERMES_CANCEL_TOMBSTONE_LIMIT
+    {
+        if let Some(oldest) = state
+            .pending_cancellations
+            .iter()
+            .min_by_key(|(_, created_at)| *created_at)
+            .map(|(exchange_id, _)| exchange_id.clone())
+        {
+            state.pending_cancellations.remove(&oldest);
+        }
+    }
+    state
+        .pending_cancellations
+        .insert(exchange_id.to_string(), now);
+}
+
+impl ActiveHermesTurns {
+    fn begin(
+        &self,
+        exchange_id: String,
+    ) -> Result<
+        (
+            ActiveHermesTurnGuard,
+            TurnCancelHandle,
+            watch::Receiver<bool>,
+        ),
+        String,
+    > {
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let (cancel, receiver) = TurnCancelHandle::new();
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| "Hermes turn state is unavailable")?;
+        prune_turn_cancel_tombstones(&mut state, StdInstant::now());
+        let cancelled_before_begin = state.pending_cancellations.remove(&exchange_id).is_some();
+        if let Some(previous) = state.turns.insert(
+            exchange_id.clone(),
+            ActiveHermesTurn {
+                id,
+                cancel: cancel.clone(),
+            },
+        ) {
+            previous.cancel.cancel();
+        }
+        if cancelled_before_begin {
+            cancel.cancel();
+        }
+        drop(state);
+        Ok((
+            ActiveHermesTurnGuard {
+                exchange_id,
+                id,
+                turns: self.clone(),
+            },
+            cancel,
+            receiver,
+        ))
+    }
+
+    fn cancel(&self, exchange_id: &str) -> Result<bool, String> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| "Hermes turn state is unavailable")?;
+        if let Some(turn) = state.turns.get(exchange_id) {
+            turn.cancel.cancel();
+            return Ok(true);
+        }
+        record_turn_cancel_tombstone(&mut state, exchange_id, StdInstant::now());
+        Ok(false)
     }
 }
 
@@ -170,7 +361,7 @@ impl Drop for SpeachesBackend {
     fn drop(&mut self) {
         if let Ok(slot) = self.0.get_mut() {
             if let Some(process) = slot.as_mut() {
-                let _ = process.child.kill();
+                terminate_child(&mut process.child);
             }
         }
     }
@@ -190,15 +381,74 @@ impl Drop for WindowsKillJob {
 #[derive(Default)]
 struct PreviousChatMenu(Mutex<Option<MenuItem<tauri::Wry>>>);
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct SessionShortcutConfig {
     shortcut: String,
     session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ShortcutSnapshot {
+    prompt_shortcut: String,
+    prompt_registered: bool,
+    shortcuts: Vec<SessionShortcutConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveShortcutConfiguration {
+    prompt_shortcut: String,
+    prompt: Shortcut,
+    session_shortcuts: Vec<SessionShortcutConfig>,
+    session_by_shortcut: HashMap<u32, String>,
+    registered: HashMap<u32, Shortcut>,
+}
+
+impl Default for ActiveShortcutConfiguration {
+    fn default() -> Self {
+        let prompt = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+        Self {
+            prompt_shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+            prompt,
+            session_shortcuts: Vec::new(),
+            session_by_shortcut: HashMap::new(),
+            registered: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Default)]
-struct SessionShortcutState(Mutex<Vec<SessionShortcutConfig>>);
+struct ShortcutConfigurationState(Mutex<ActiveShortcutConfiguration>);
+
+#[derive(Default)]
+struct ShortcutUpdateState(Mutex<()>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfiguredShortcutAction {
+    Prompt,
+    Session(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PersistedPromptShortcut {
+    version: u8,
+    shortcut: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptShortcutSource {
+    Central,
+    Legacy,
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupPromptShortcut {
+    shortcut: String,
+    source: PromptShortcutSource,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct PersistedSettings {
@@ -211,6 +461,8 @@ struct PersistedSettings {
 struct LoadedSettings {
     settings: Option<PersistedSettings>,
     migrate_local_storage: bool,
+    legacy_prompt_shortcut: Option<String>,
+    profile_key: String,
 }
 
 struct SettingsConfigOverride(Result<Option<PathBuf>, String>);
@@ -542,7 +794,42 @@ fn remote_hermes_connection(
     })
 }
 
-fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
+fn hermes_timeout_error(phase: &str) -> String {
+    format!("HERMES_TIMEOUT:{phase}")
+}
+
+fn wait_for_hermes_startup(
+    receiver: &mpsc::Receiver<Result<u16, String>>,
+    cancellation: Option<&TurnCancelHandle>,
+    timeout: Duration,
+) -> Result<u16, String> {
+    let deadline = StdInstant::now() + timeout;
+    loop {
+        if cancellation.is_some_and(TurnCancelHandle::is_cancelled) {
+            return Err(HERMES_TURN_CANCELLED.to_string());
+        }
+        let remaining = deadline.saturating_duration_since(StdInstant::now());
+        if remaining.is_zero() {
+            return Err(hermes_timeout_error("startup"));
+        }
+        let poll = if cancellation.is_some() {
+            remaining.min(Duration::from_millis(50))
+        } else {
+            remaining
+        };
+        match receiver.recv_timeout(poll) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Hermes gateway startup reader stopped unexpectedly".to_string())
+            }
+        }
+    }
+}
+
+fn start_hermes_backend_with_cancel(
+    cancellation: Option<&TurnCancelHandle>,
+) -> Result<HermesBackendProcess, String> {
     let address = "127.0.0.1";
     let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let mut command = Command::new(hermes_binary()?);
@@ -570,7 +857,7 @@ fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
     let job = match assign_process_job_and_resume(&child) {
         Ok(job) => job,
         Err(error) => {
-            let _ = child.kill();
+            terminate_child(&mut child);
             return Err(error);
         }
     };
@@ -578,39 +865,53 @@ fn start_hermes_backend() -> Result<HermesBackendProcess, String> {
         .stdout
         .take()
         .ok_or_else(|| "Hermes gateway did not expose its startup output".to_string())?;
-    let mut reader = BufReader::new(stdout);
-    let actual_port = loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                let _ = child.kill();
-                return Err("Hermes gateway exited before it became ready".to_string());
-            }
-            Ok(_) => {
-                if let Some(value) = line.split("HERMES_BACKEND_READY port=").nth(1) {
-                    break value
-                        .split_whitespace()
-                        .next()
-                        .ok_or_else(|| "Hermes gateway returned an invalid port".to_string())?
-                        .parse::<u16>()
-                        .map_err(|error| {
-                            format!("Hermes gateway returned an invalid port: {error}")
-                        })?;
+    let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let startup_result = loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    break Err("Hermes gateway exited before it became ready".to_string());
+                }
+                Ok(_) => {
+                    if let Some(value) = line.split("HERMES_BACKEND_READY port=").nth(1) {
+                        let port = value
+                            .split_whitespace()
+                            .next()
+                            .ok_or_else(|| "Hermes gateway returned an invalid port".to_string())
+                            .and_then(|port| {
+                                port.parse::<u16>().map_err(|error| {
+                                    format!("Hermes gateway returned an invalid port: {error}")
+                                })
+                            });
+                        break port;
+                    }
+                }
+                Err(error) => {
+                    break Err(format!("Could not read Hermes gateway startup: {error}"));
                 }
             }
-            Err(error) => {
-                let _ = child.kill();
-                return Err(format!("Could not read Hermes gateway startup: {error}"));
-            }
+        };
+        let ready = startup_result.is_ok();
+        let _ = startup_sender.send(startup_result);
+        if !ready {
+            return;
         }
-    };
-    thread::spawn(move || {
         for line in reader.lines() {
             if line.is_err() {
                 break;
             }
         }
     });
+    let actual_port =
+        match wait_for_hermes_startup(&startup_receiver, cancellation, HERMES_STARTUP_TIMEOUT) {
+            Ok(port) => port,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(error);
+            }
+        };
 
     Ok(HermesBackendProcess {
         child,
@@ -634,24 +935,55 @@ fn configure_hermes_instance(
     }
     let mut backend = state
         .0
+        .state
         .lock()
         .map_err(|_| "Hermes gateway state is unavailable")?;
     if backend.config == config {
         return Ok(());
     }
     if let Some(process) = backend.process.as_mut() {
-        let _ = process.child.kill();
+        terminate_child(&mut process.child);
     }
     backend.process = None;
     backend.config = config;
     Ok(())
 }
 
-fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConnection, String> {
-    let mut backend = state
-        .0
-        .lock()
-        .map_err(|_| "Hermes gateway state is unavailable")?;
+fn lock_hermes_backend_state<'a>(
+    state: &'a HermesBackend,
+    cancellation: Option<&TurnCancelHandle>,
+) -> Result<std::sync::MutexGuard<'a, HermesBackendState>, String> {
+    let Some(cancellation) = cancellation else {
+        return state
+            .0
+            .state
+            .lock()
+            .map_err(|_| "Hermes gateway state is unavailable".to_string());
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(HERMES_TURN_CANCELLED.to_string());
+        }
+        match state.0.state.try_lock() {
+            Ok(backend) => return Ok(backend),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Hermes gateway state is unavailable".to_string());
+            }
+        }
+    }
+}
+
+fn hermes_gateway_connection_with_cancel(
+    state: &HermesBackend,
+    cancellation: Option<&TurnCancelHandle>,
+) -> Result<HermesGatewayConnection, String> {
+    let mut backend = lock_hermes_backend_state(state, cancellation)?;
+    if cancellation.is_some_and(TurnCancelHandle::is_cancelled) {
+        return Err(HERMES_TURN_CANCELLED.to_string());
+    }
     if backend.config.remote {
         return remote_hermes_connection(&backend.config);
     }
@@ -665,10 +997,14 @@ fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConne
             return Ok(process.connection.clone());
         }
     }
-    let process = start_hermes_backend()?;
+    let process = start_hermes_backend_with_cancel(cancellation)?;
     let connection = process.connection.clone();
     backend.process = Some(process);
     Ok(connection)
+}
+
+fn hermes_gateway_connection(state: &HermesBackend) -> Result<HermesGatewayConnection, String> {
+    hermes_gateway_connection_with_cancel(state, None)
 }
 
 fn transcription_timeout(data_url_len: usize) -> Duration {
@@ -935,7 +1271,7 @@ fn spawn_speaches() -> Result<SpeachesProcess, String> {
     let job = match assign_process_job_and_resume(&child) {
         Ok(job) => job,
         Err(error) => {
-            let _ = child.kill();
+            terminate_child(&mut child);
             return Err(error);
         }
     };
@@ -1044,10 +1380,145 @@ where
     Err("Hermes gateway disconnected".to_string())
 }
 
+fn turn_operation_deadline(
+    now: TokioInstant,
+    phase_timeout: Duration,
+    overall_deadline: TokioInstant,
+    phase: &'static str,
+) -> (TokioInstant, &'static str) {
+    let phase_deadline = now + phase_timeout;
+    if phase_deadline < overall_deadline {
+        (phase_deadline, phase)
+    } else {
+        (overall_deadline, "overall")
+    }
+}
+
+async fn wait_for_turn_cancellation(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn await_turn_operation<T, F>(
+    future: F,
+    cancellation: &mut watch::Receiver<bool>,
+    phase: &'static str,
+    phase_timeout: Duration,
+    overall_deadline: TokioInstant,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let (deadline, timeout_phase) =
+        turn_operation_deadline(TokioInstant::now(), phase_timeout, overall_deadline, phase);
+    tokio::select! {
+        biased;
+        _ = wait_for_turn_cancellation(cancellation) => {
+            Err(HERMES_TURN_CANCELLED.to_string())
+        }
+        result = tokio::time::timeout_at(deadline, future) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(hermes_timeout_error(timeout_phase)),
+            }
+        }
+    }
+}
+
+async fn gateway_rpc_for_turn<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: u64,
+    method: &str,
+    params: Value,
+    cancellation: &mut watch::Receiver<bool>,
+    overall_deadline: TokioInstant,
+) -> Result<Value, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    await_turn_operation(
+        gateway_rpc(socket, id, method, params),
+        cancellation,
+        "rpc",
+        HERMES_RPC_TIMEOUT,
+        overall_deadline,
+    )
+    .await
+}
+
+async fn wait_for_turn_frame<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    cancellation: &mut watch::Receiver<bool>,
+    idle_deadline: TokioInstant,
+    overall_deadline: TokioInstant,
+) -> Result<Option<Message>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (deadline, timeout_phase) = if idle_deadline < overall_deadline {
+        (idle_deadline, "idle")
+    } else {
+        (overall_deadline, "overall")
+    };
+    tokio::select! {
+        biased;
+        _ = wait_for_turn_cancellation(cancellation) => {
+            Err(HERMES_TURN_CANCELLED.to_string())
+        }
+        frame = tokio::time::timeout_at(deadline, socket.next()) => {
+            match frame {
+                Ok(Some(Ok(frame))) => Ok(Some(frame)),
+                Ok(Some(Err(error))) => Err(format!("Hermes gateway disconnected: {error}")),
+                Ok(None) => Ok(None),
+                Err(_) => Err(hermes_timeout_error(timeout_phase)),
+            }
+        }
+    }
+}
+
+async fn interrupt_hermes_session<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    request_id: &mut u64,
+    runtime_session_id: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    *request_id += 1;
+    let _ = tokio::time::timeout(
+        HERMES_INTERRUPT_TIMEOUT,
+        gateway_rpc(
+            socket,
+            *request_id,
+            "session.interrupt",
+            json!({ "session_id": runtime_session_id }),
+        ),
+    )
+    .await;
+}
+
+#[tauri::command]
+fn cancel_hermes_turn(
+    exchange_id: String,
+    state: tauri::State<'_, ActiveHermesTurns>,
+) -> Result<bool, String> {
+    if exchange_id.trim().is_empty() {
+        return Ok(false);
+    }
+    state.cancel(&exchange_id)
+}
+
 #[tauri::command]
 async fn ask_hermes_gateway(
     app: AppHandle,
     state: tauri::State<'_, HermesBackend>,
+    active_turns: tauri::State<'_, ActiveHermesTurns>,
     request: HermesTurnRequest,
 ) -> Result<HermesTurnResponse, String> {
     let HermesTurnRequest {
@@ -1060,10 +1531,44 @@ async fn ask_hermes_gateway(
         reasoning_effort,
         fast,
     } = request;
-    let connection = hermes_gateway_connection(&state)?;
-    let (mut socket, _) = connect_async(&connection.ws_url)
-        .await
-        .map_err(|error| format!("Could not connect to Hermes backend: {error}"))?;
+    let (_turn_guard, cancel_handle, mut cancellation) = active_turns.begin(exchange_id.clone())?;
+    let overall_deadline = TokioInstant::now() + HERMES_TURN_OVERALL_TIMEOUT;
+    let backend = state.inner().clone();
+    let startup_cancel = cancel_handle.clone();
+    let mut startup_task = tokio::task::spawn_blocking(move || {
+        hermes_gateway_connection_with_cancel(&backend, Some(&startup_cancel))
+    });
+    let startup_wait = await_turn_operation(
+        async { Ok::<_, String>((&mut startup_task).await) },
+        &mut cancellation,
+        "startup",
+        HERMES_STARTUP_TIMEOUT,
+        overall_deadline,
+    )
+    .await;
+    let connection = match startup_wait {
+        Ok(joined) => {
+            joined.map_err(|error| format!("Hermes gateway startup task failed: {error}"))??
+        }
+        Err(error) => {
+            cancel_handle.cancel();
+            let _ = startup_task.await;
+            return Err(error);
+        }
+    };
+    let websocket_url = connection.ws_url.clone();
+    let (mut socket, _) = await_turn_operation(
+        async move {
+            connect_async(&websocket_url)
+                .await
+                .map_err(|error| format!("Could not connect to Hermes backend: {error}"))
+        },
+        &mut cancellation,
+        "connect",
+        HERMES_CONNECT_TIMEOUT,
+        overall_deadline,
+    )
+    .await?;
     let mut request_id = 0_u64;
     let supplied_runtime_id = runtime_session_id.filter(|id| !id.trim().is_empty());
     let runtime_id: Option<String>;
@@ -1075,11 +1580,13 @@ async fn ask_hermes_gateway(
     // session to its continuation instead of trusting stale frontend state.
     if stored_id.is_some() {
         request_id += 1;
-        let result = gateway_rpc(
+        let result = gateway_rpc_for_turn(
             &mut socket,
             request_id,
             "session.resume",
             json!({ "session_id": stored_id.as_ref().unwrap(), "source": "desktop" }),
+            &mut cancellation,
+            overall_deadline,
         )
         .await?;
         runtime_id = result
@@ -1096,7 +1603,7 @@ async fn ask_hermes_gateway(
         runtime_id = supplied_runtime_id;
     } else {
         request_id += 1;
-        let result = gateway_rpc(
+        let result = gateway_rpc_for_turn(
             &mut socket,
             request_id,
             "session.create",
@@ -1106,6 +1613,8 @@ async fn ask_hermes_gateway(
                 "reasoning_effort": reasoning_effort.unwrap_or_default(),
                 "fast": fast.unwrap_or(false),
             }),
+            &mut cancellation,
+            overall_deadline,
         )
         .await?;
         runtime_id = result
@@ -1135,7 +1644,7 @@ async fn ask_hermes_gateway(
 
     for (index, data_url) in image_data_urls.iter().enumerate() {
         request_id += 1;
-        gateway_rpc(
+        gateway_rpc_for_turn(
             &mut socket,
             request_id,
             "image.attach_bytes",
@@ -1144,30 +1653,69 @@ async fn ask_hermes_gateway(
                 "content_base64": data_url,
                 "filename": format!("ask-hermes-{}.png", index + 1),
             }),
+            &mut cancellation,
+            overall_deadline,
         )
         .await?;
     }
 
     request_id += 1;
-    socket
-        .send(Message::Text(
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "prompt.submit",
-                "params": { "session_id": runtime_id, "text": prompt },
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .map_err(|error| format!("Could not submit the prompt to Hermes: {error}"))?;
+    let prompt_request_id = request_id;
+    let prompt_message = Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": prompt_request_id,
+            "method": "prompt.submit",
+            "params": { "session_id": runtime_id, "text": prompt },
+        })
+        .to_string()
+        .into(),
+    );
+    if let Err(error) = await_turn_operation(
+        async {
+            socket
+                .send(prompt_message)
+                .await
+                .map_err(|error| format!("Could not submit the prompt to Hermes: {error}"))
+        },
+        &mut cancellation,
+        "rpc",
+        HERMES_RPC_TIMEOUT,
+        overall_deadline,
+    )
+    .await
+    {
+        interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+        return Err(error);
+    }
 
-    while let Some(frame) = socket.next().await {
-        let frame = frame.map_err(|error| format!("Hermes gateway disconnected: {error}"))?;
+    let mut idle_deadline = TokioInstant::now() + HERMES_TURN_IDLE_TIMEOUT;
+    loop {
+        let frame = match wait_for_turn_frame(
+            &mut socket,
+            &mut cancellation,
+            idle_deadline,
+            overall_deadline,
+        )
+        .await
+        {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+                return Err(error);
+            }
+        };
         let Message::Text(text) = frame else { continue };
-        let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        if value.get("id").and_then(Value::as_u64) == Some(request_id) {
+        let value: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+                return Err(error.to_string());
+            }
+        };
+        if value.get("id").and_then(Value::as_u64) == Some(prompt_request_id) {
+            idle_deadline = TokioInstant::now() + HERMES_TURN_IDLE_TIMEOUT;
             if let Some(error) = value.get("error") {
                 return Err(error
                     .get("message")
@@ -1183,6 +1731,7 @@ async fn ask_hermes_gateway(
         if params.get("session_id").and_then(Value::as_str) != Some(runtime_id.as_str()) {
             continue;
         }
+        idle_deadline = TokioInstant::now() + HERMES_TURN_IDLE_TIMEOUT;
         let event_type = params
             .get("type")
             .and_then(Value::as_str)
@@ -1194,7 +1743,7 @@ async fn ask_hermes_gateway(
             .unwrap_or_default();
         match event_type {
             "tool.start" | "tool.started" => {
-                app.emit(
+                if let Err(error) = app.emit(
                     "hermes-turn-activity",
                     HermesTurnActivity {
                         exchange_id: exchange_id.clone(),
@@ -1209,11 +1758,13 @@ async fn ask_hermes_gateway(
                             .filter(|value| !value.trim().is_empty())
                             .map(str::to_string),
                     },
-                )
-                .map_err(|error| error.to_string())?;
+                ) {
+                    interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+                    return Err(error.to_string());
+                }
             }
             "tool.complete" | "tool.completed" | "tool.failed" | "reasoning.available" => {
-                app.emit(
+                if let Err(error) = app.emit(
                     "hermes-turn-activity",
                     HermesTurnActivity {
                         exchange_id: exchange_id.clone(),
@@ -1221,18 +1772,22 @@ async fn ask_hermes_gateway(
                         tool_name: None,
                         context: None,
                     },
-                )
-                .map_err(|error| error.to_string())?;
+                ) {
+                    interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+                    return Err(error.to_string());
+                }
             }
             "message.delta" if !text.is_empty() => {
-                app.emit(
+                if let Err(error) = app.emit(
                     "hermes-answer-delta",
                     HermesAnswerDelta {
                         exchange_id: exchange_id.clone(),
                         text: text.to_string(),
                     },
-                )
-                .map_err(|error| error.to_string())?;
+                ) {
+                    interrupt_hermes_session(&mut socket, &mut request_id, &runtime_id).await;
+                    return Err(error.to_string());
+                }
             }
             "message.complete" => {
                 if payload.get("status").and_then(Value::as_str) == Some("error") {
@@ -1267,27 +1822,73 @@ fn set_previous_chat_available(
     Ok(())
 }
 
-fn register_session_shortcut(
-    app: &AppHandle,
-    binding: &SessionShortcutConfig,
+fn clear_active_session_shortcut(state: &ActiveSessionShortcut) -> Result<(), String> {
+    *state
+        .0
+        .lock()
+        .map_err(|_| "Session shortcut state is unavailable")? = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_session_shortcut_context(
+    state: tauri::State<'_, ActiveSessionShortcut>,
 ) -> Result<(), String> {
-    let shortcut = binding
-        .shortcut
+    clear_active_session_shortcut(state.inner())
+}
+
+fn configured_shortcut_action(
+    configuration: &ActiveShortcutConfiguration,
+    shortcut_id: u32,
+) -> Option<ConfiguredShortcutAction> {
+    if configuration.prompt.id() == shortcut_id {
+        return Some(ConfiguredShortcutAction::Prompt);
+    }
+    configuration
+        .session_by_shortcut
+        .get(&shortcut_id)
+        .cloned()
+        .map(ConfiguredShortcutAction::Session)
+}
+
+fn parse_modified_shortcut(value: &str, label: &str) -> Result<Shortcut, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    let shortcut = value
         .parse::<Shortcut>()
-        .map_err(|error| format!("Invalid shortcut {}: {error}", binding.shortcut))?;
-    let session_id = binding.session_id.clone();
-    app.global_shortcut()
-        .on_shortcut(shortcut, move |app, _, event| {
-            if event.state() != ShortcutState::Pressed {
-                return;
-            }
-            show_session_shortcut(app, &session_id);
-        })
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("Invalid shortcut {value}: {error}"))?;
+    if shortcut.mods.is_empty() {
+        return Err(format!("{label} must include Ctrl, Alt, Shift, or Super"));
+    }
+    Ok(shortcut)
+}
+
+fn reject_reserved_app_shortcut(
+    shortcut: &Shortcut,
+    shortcut_text: &str,
+    label: &str,
+) -> Result<(), String> {
+    for (reserved_text, purpose) in RESERVED_APP_SHORTCUTS {
+        let reserved = reserved_text
+            .parse::<Shortcut>()
+            .expect("reserved app shortcuts must be valid");
+        if shortcut.id() == reserved.id() {
+            return Err(format!(
+                "{label} {shortcut_text} conflicts with the {purpose} shortcut"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn should_hide_session_shortcut(visible: bool, active: Option<&str>, requested: &str) -> bool {
     visible && active == Some(requested)
+}
+
+fn should_dispatch_global_shortcut(settings_open: bool) -> bool {
+    !settings_open
 }
 
 fn show_session_shortcut(app: &AppHandle, session_id: &str) {
@@ -1314,9 +1915,169 @@ fn show_session_shortcut(app: &AppHandle, session_id: &str) {
         *active = Some(session_id.to_string());
     }
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_size(Size::Logical(tauri::LogicalSize::new(620.0, 360.0)));
         let _ = show_main_above_capture(&window);
         let _ = window.emit("open-session-shortcut", session_id);
+    }
+}
+
+fn uses_default_settings_profile(configured: &SettingsConfigOverride) -> bool {
+    matches!(&configured.0, Ok(None))
+}
+
+fn normalized_settings_profile_path(path: &Path) -> String {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    let normalized = normalized.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    normalized
+}
+
+fn stable_settings_profile_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in normalized_settings_profile_path(path).as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn settings_profile_key(configured: &SettingsConfigOverride) -> Result<String, String> {
+    match &configured.0 {
+        Ok(None) => Ok(DEFAULT_SETTINGS_PROFILE_KEY.to_string()),
+        Ok(Some(path)) => Ok(format!(
+            "{CUSTOM_SETTINGS_PROFILE_KEY_PREFIX}{:016x}",
+            stable_settings_profile_hash(path)
+        )),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn prompt_shortcut_config_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join(PROMPT_SHORTCUT_CONFIG_FILE))
+        .map_err(|error| format!("Could not locate app configuration: {error}"))
+}
+
+fn load_persisted_prompt_shortcut_from_path(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Could not inspect prompt shortcut: {error}")),
+    };
+    if metadata.len() > SETTINGS_CONFIG_MAX_BYTES {
+        return Err(format!(
+            "Prompt shortcut file exceeds {} bytes",
+            SETTINGS_CONFIG_MAX_BYTES
+        ));
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("Could not read prompt shortcut: {error}"))?;
+    let persisted = serde_json::from_str::<PersistedPromptShortcut>(&contents)
+        .map_err(|error| format!("Could not parse prompt shortcut: {error}"))?;
+    if persisted.version != 1 {
+        return Err(format!(
+            "Unsupported prompt shortcut settings version {}",
+            persisted.version
+        ));
+    }
+    parse_modified_shortcut(&persisted.shortcut, "Prompt shortcut")?;
+    Ok(Some(persisted.shortcut.trim().to_string()))
+}
+
+fn load_persisted_prompt_shortcut(app: &AppHandle) -> Result<Option<String>, String> {
+    load_persisted_prompt_shortcut_from_path(&prompt_shortcut_config_path(app)?)
+}
+
+fn valid_legacy_prompt_shortcut(
+    app: &AppHandle,
+    configured: &SettingsConfigOverride,
+    central_settings: Option<&PersistedSettings>,
+) -> Option<String> {
+    if !uses_default_settings_profile(configured)
+        || central_settings
+            .and_then(|settings| settings.values.get(PROMPT_SHORTCUT_SETTING_KEY))
+            .is_some()
+    {
+        return None;
+    }
+    load_persisted_prompt_shortcut(app)
+        .ok()
+        .flatten()
+        .filter(|shortcut| validate_shortcut_configuration(shortcut, &[]).is_ok())
+}
+
+fn choose_startup_prompt_shortcut(
+    central: Option<&str>,
+    legacy: Option<&str>,
+    allow_legacy: bool,
+) -> StartupPromptShortcut {
+    if let Some(shortcut) = central {
+        return StartupPromptShortcut {
+            shortcut: shortcut.to_string(),
+            source: PromptShortcutSource::Central,
+        };
+    }
+    if allow_legacy {
+        if let Some(shortcut) = legacy {
+            return StartupPromptShortcut {
+                shortcut: shortcut.to_string(),
+                source: PromptShortcutSource::Legacy,
+            };
+        }
+    }
+    StartupPromptShortcut {
+        shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+        source: PromptShortcutSource::Default,
+    }
+}
+
+fn migrate_legacy_prompt_shortcut_to_settings(
+    path: &Path,
+    central_settings: &PersistedSettings,
+    shortcut: &str,
+) -> Result<bool, String> {
+    if central_settings
+        .values
+        .contains_key(PROMPT_SHORTCUT_SETTING_KEY)
+    {
+        return Ok(false);
+    }
+    let mut migrated = central_settings.clone();
+    migrated.values.insert(
+        PROMPT_SHORTCUT_SETTING_KEY.to_string(),
+        shortcut.to_string(),
+    );
+    save_settings_to_path(path, &migrated)?;
+    Ok(true)
+}
+
+fn should_cleanup_legacy_prompt_shortcut(
+    configured: &SettingsConfigOverride,
+    settings: &PersistedSettings,
+) -> bool {
+    uses_default_settings_profile(configured)
+        && settings.values.contains_key(PROMPT_SHORTCUT_SETTING_KEY)
+}
+
+fn remove_legacy_prompt_shortcut_from_path(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Could not remove migrated prompt shortcut: {error}"
+        )),
     }
 }
 
@@ -1467,10 +2228,15 @@ fn load_settings(
     app: AppHandle,
     configured: tauri::State<'_, SettingsConfigOverride>,
 ) -> Result<LoadedSettings, String> {
-    let migrate_local_storage = matches!(&configured.0, Ok(None));
+    let migrate_local_storage = uses_default_settings_profile(&configured);
+    let profile_key = settings_profile_key(&configured)?;
+    let settings = load_settings_from_path(&settings_config_path(&app, &configured)?)?;
+    let legacy_prompt_shortcut = valid_legacy_prompt_shortcut(&app, &configured, settings.as_ref());
     Ok(LoadedSettings {
-        settings: load_settings_from_path(&settings_config_path(&app, &configured)?)?,
+        settings,
         migrate_local_storage,
+        legacy_prompt_shortcut,
+        profile_key,
     })
 }
 
@@ -1485,61 +2251,146 @@ fn save_settings(
         .0
         .lock()
         .map_err(|_| "Settings writer is unavailable".to_string())?;
-    save_settings_to_path(&settings_config_path(&app, &configured)?, &settings)
+    save_settings_to_path(&settings_config_path(&app, &configured)?, &settings)?;
+    if should_cleanup_legacy_prompt_shortcut(&configured, &settings) {
+        if let Ok(path) = prompt_shortcut_config_path(&app) {
+            let _ = remove_legacy_prompt_shortcut_from_path(&path);
+        }
+    }
+    Ok(())
 }
 
-#[tauri::command]
-fn set_session_shortcuts(
-    app: AppHandle,
-    shortcuts: Vec<SessionShortcutConfig>,
-    state: tauri::State<'_, SessionShortcutState>,
-) -> Result<(), String> {
-    let base_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-    let mut ids = HashSet::new();
-    for binding in &shortcuts {
-        if binding.shortcut.trim().is_empty() || binding.session_id.trim().is_empty() {
+fn validate_shortcut_configuration(
+    prompt_shortcut: &str,
+    shortcuts: &[SessionShortcutConfig],
+) -> Result<ActiveShortcutConfiguration, String> {
+    let prompt_shortcut = prompt_shortcut.trim();
+    let prompt = parse_modified_shortcut(prompt_shortcut, "Prompt shortcut")?;
+    reject_reserved_app_shortcut(&prompt, prompt_shortcut, "Prompt shortcut")?;
+    let mut registered = HashMap::from([(prompt.id(), prompt)]);
+    let mut session_by_shortcut = HashMap::new();
+    let mut normalized_shortcuts = Vec::with_capacity(shortcuts.len());
+    for binding in shortcuts {
+        let shortcut_text = binding.shortcut.trim();
+        let session_id = binding.session_id.trim();
+        if shortcut_text.is_empty() || session_id.is_empty() {
             return Err(
                 "Every session shortcut needs both a key combination and a session".to_string(),
             );
         }
-        let parsed = binding
-            .shortcut
-            .parse::<Shortcut>()
-            .map_err(|error| format!("Invalid shortcut {}: {error}", binding.shortcut))?;
-        if parsed.id() == base_shortcut.id() {
-            return Err("Alt+Space is reserved for the main Ask Hermes prompt".to_string());
-        }
-        if !ids.insert(parsed.id()) {
+        let shortcut = parse_modified_shortcut(shortcut_text, "Session shortcut")?;
+        reject_reserved_app_shortcut(&shortcut, shortcut_text, "Session shortcut")?;
+        if shortcut.id() == prompt.id() {
             return Err(format!(
-                "Shortcut {} is assigned more than once",
-                binding.shortcut
+                "{shortcut_text} is already assigned to Open Ask Hermes"
             ));
         }
+        if registered.insert(shortcut.id(), shortcut).is_some() {
+            return Err(format!(
+                "Shortcut {shortcut_text} is assigned more than once"
+            ));
+        }
+        session_by_shortcut.insert(shortcut.id(), session_id.to_string());
+        normalized_shortcuts.push(SessionShortcutConfig {
+            shortcut: shortcut_text.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+    Ok(ActiveShortcutConfiguration {
+        prompt_shortcut: prompt_shortcut.to_string(),
+        prompt,
+        session_shortcuts: normalized_shortcuts,
+        session_by_shortcut,
+        registered,
+    })
+}
+
+fn shortcut_registration_delta(
+    active: &ActiveShortcutConfiguration,
+    next: &ActiveShortcutConfiguration,
+) -> (Vec<Shortcut>, Vec<Shortcut>) {
+    let additions = next
+        .registered
+        .iter()
+        .filter(|(id, _)| !active.registered.contains_key(id))
+        .map(|(_, shortcut)| *shortcut)
+        .collect();
+    let removals = active
+        .registered
+        .iter()
+        .filter(|(id, _)| !next.registered.contains_key(id))
+        .map(|(_, shortcut)| *shortcut)
+        .collect();
+    (additions, removals)
+}
+
+fn replace_registered_shortcuts_with(
+    active: &mut ActiveShortcutConfiguration,
+    next: ActiveShortcutConfiguration,
+    mut register: impl FnMut(Shortcut) -> Result<(), String>,
+    mut unregister: impl FnMut(Shortcut) -> Result<(), String>,
+) -> Result<(), String> {
+    let (additions, removals) = shortcut_registration_delta(active, &next);
+    let mut registered_additions = Vec::new();
+    for shortcut in additions {
+        if let Err(error) = register(shortcut) {
+            for registered in registered_additions {
+                if unregister(registered).is_err() {
+                    // Registration succeeded but rollback did not. Keep the
+                    // actionless OS binding tracked so a later save retries it.
+                    active.registered.insert(registered.id(), registered);
+                }
+            }
+            return Err(format!("Could not register shortcut {shortcut}: {error}"));
+        }
+        registered_additions.push(shortcut);
     }
 
-    let mut active = state
+    let mut next = next;
+    for shortcut in removals {
+        if unregister(shortcut).is_err() {
+            // Keep stale OS registrations tracked but route no action to them.
+            // Later saves retry cleanup; process exit always releases them.
+            next.registered.insert(shortcut.id(), shortcut);
+        }
+    }
+    *active = next;
+    Ok(())
+}
+
+fn replace_registered_shortcuts_in_state_with(
+    state: &ShortcutConfigurationState,
+    next: ActiveShortcutConfiguration,
+    mut is_registered: impl FnMut(Shortcut) -> bool,
+    register: impl FnMut(Shortcut) -> Result<(), String>,
+    unregister: impl FnMut(Shortcut) -> Result<(), String>,
+) -> Result<ActiveShortcutConfiguration, String> {
+    let mut applied = state
         .0
         .lock()
-        .map_err(|_| "Session shortcut state is unavailable")?;
-    for binding in active.iter() {
-        let _ = app.global_shortcut().unregister(binding.shortcut.as_str());
-    }
-    let mut registered: Vec<String> = Vec::new();
-    for binding in &shortcuts {
-        if let Err(error) = register_session_shortcut(&app, binding) {
-            for item in &registered {
-                let _ = app.global_shortcut().unregister(item.as_str());
-            }
-            for previous in active.iter() {
-                let _ = register_session_shortcut(&app, previous);
-            }
-            return Err(error);
+        .map_err(|_| "Shortcut configuration state is unavailable")?
+        .clone();
+    for shortcut in next.registered.values() {
+        if !applied.registered.contains_key(&shortcut.id()) && is_registered(*shortcut) {
+            // Plugin still owns this OS binding, but an earlier failed update
+            // lost local bookkeeping. Recover ownership instead of trying to
+            // register the same binding twice.
+            applied.registered.insert(shortcut.id(), *shortcut);
         }
-        registered.push(binding.shortcut.clone());
     }
-    *active = shortcuts.clone();
-    drop(active);
+    let update = replace_registered_shortcuts_with(&mut applied, next, register, unregister);
+    *state
+        .0
+        .lock()
+        .map_err(|_| "Shortcut configuration state is unavailable")? = applied.clone();
+    update?;
+    Ok(applied)
+}
 
+fn update_session_shortcut_tray(
+    app: &AppHandle,
+    shortcuts: &[SessionShortcutConfig],
+) -> Result<(), String> {
     let titles = query_sessions(1000)
         .unwrap_or_default()
         .into_iter()
@@ -1562,7 +2413,7 @@ fn set_session_shortcuts(
                 .cloned()
                 .unwrap_or_else(|| "Untitled session".to_string());
             let item = MenuItem::with_id(
-                &app,
+                app,
                 &item_id,
                 format!("{title}    {}", binding.shortcut),
                 true,
@@ -1586,6 +2437,64 @@ fn set_session_shortcuts(
         }
     }
     Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_shortcuts(
+    app: AppHandle,
+    prompt_shortcut: String,
+    shortcuts: Vec<SessionShortcutConfig>,
+    state: tauri::State<'_, ShortcutConfigurationState>,
+    updates: tauri::State<'_, ShortcutUpdateState>,
+) -> Result<(), String> {
+    let next = validate_shortcut_configuration(&prompt_shortcut, &shortcuts)?;
+    let _update = updates
+        .0
+        .lock()
+        .map_err(|_| "Shortcut updater is unavailable")?;
+    let applied = replace_registered_shortcuts_in_state_with(
+        state.inner(),
+        next,
+        |shortcut| app.global_shortcut().is_registered(shortcut),
+        |shortcut| {
+            app.global_shortcut()
+                .register(shortcut)
+                .map_err(|error| error.to_string())
+        },
+        |shortcut| {
+            app.global_shortcut()
+                .unregister(shortcut)
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    let applied_prompt = applied.prompt_shortcut.clone();
+    let applied_sessions = applied.session_shortcuts.clone();
+
+    if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
+        let _ = tray.set_tooltip(Some(format!("Ask Hermes — {applied_prompt}")));
+    }
+    update_session_shortcut_tray(&app, &applied_sessions)
+}
+
+fn shortcut_snapshot(configuration: &ActiveShortcutConfiguration) -> ShortcutSnapshot {
+    ShortcutSnapshot {
+        prompt_shortcut: configuration.prompt_shortcut.clone(),
+        prompt_registered: configuration
+            .registered
+            .contains_key(&configuration.prompt.id()),
+        shortcuts: configuration.session_shortcuts.clone(),
+    }
+}
+
+#[tauri::command]
+fn get_shortcut_snapshot(
+    state: tauri::State<'_, ShortcutConfigurationState>,
+) -> Result<ShortcutSnapshot, String> {
+    let configuration = state
+        .0
+        .lock()
+        .map_err(|_| "Shortcut configuration state is unavailable")?;
+    Ok(shortcut_snapshot(&configuration))
 }
 
 fn image_data_url(image: &RgbaImage) -> Result<String, String> {
@@ -1749,6 +2658,32 @@ fn apply_main_shape(_window: &WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+fn recover_selection(app: &AppHandle, state: &PendingCapture) -> Result<(), String> {
+    let mut errors = Vec::new();
+    match state.0.lock() {
+        Ok(mut pending) => *pending = None,
+        Err(_) => errors.push("Capture state lock failed".to_string()),
+    }
+    if let Some(capture) = app.get_webview_window("capture") {
+        if let Err(error) = capture.hide() {
+            errors.push(error.to_string());
+        }
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        if let Err(error) = show_main_above_capture(&main) {
+            errors.push(error);
+        }
+        if let Err(error) = main.emit("selection-ready", ()) {
+            errors.push(error.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 #[tauri::command]
 async fn start_selection(
     app: AppHandle,
@@ -1757,19 +2692,33 @@ async fn start_selection(
     if let Some(main) = app.get_webview_window("main") {
         main.hide().map_err(|error| error.to_string())?;
     }
-    let captured_result = tauri::async_runtime::spawn_blocking(capture_desktop)
-        .await
-        .map_err(|error| format!("Screen capture task failed: {error}"));
-    let captured = captured_result??;
-    let background = image_jpeg_data_url(&captured.image)?;
-    *state.0.lock().map_err(|_| "Capture state lock failed")? = Some(captured);
-    prepare_selection_overlay(&app)?;
-    if let Some(capture) = app.get_webview_window("capture") {
-        capture
-            .emit("selection-background", background)
-            .map_err(|error| error.to_string())?;
+    let result = async {
+        let captured_result = tauri::async_runtime::spawn_blocking(capture_desktop)
+            .await
+            .map_err(|error| format!("Screen capture task failed: {error}"));
+        let captured = captured_result??;
+        let background = image_jpeg_data_url(&captured.image)?;
+        *state.0.lock().map_err(|_| "Capture state lock failed")? = Some(captured);
+        prepare_selection_overlay(&app)?;
+        if let Some(capture) = app.get_webview_window("capture") {
+            capture
+                .emit("selection-background", background)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(recovery_error) = recover_selection(&app, state.inner()) {
+                return Err(format!(
+                    "{error}; capture recovery failed: {recovery_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1793,76 +2742,82 @@ async fn capture_region(
     state: tauri::State<'_, PendingCapture>,
     region: NormalizedRegion,
 ) -> Result<CaptureResponse, String> {
-    window.hide().map_err(|error| error.to_string())?;
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.hide();
-    }
-    let pending = state
-        .0
-        .lock()
-        .map_err(|_| "Capture state lock failed")?
-        .take();
-    let captured = if let Some(captured) = pending {
-        captured
-    } else {
-        tauri::async_runtime::spawn_blocking(|| {
-            thread::sleep(Duration::from_millis(100));
-            capture_desktop()
-        })
-        .await
-        .map_err(|error| format!("Screen capture task failed: {error}"))??
-    };
-    let full_width = captured.image.width();
-    let full_height = captured.image.height();
-    let x = ((region.x.clamp(0.0, 1.0) * full_width as f64).round() as u32)
-        .min(full_width.saturating_sub(1));
-    let y = ((region.y.clamp(0.0, 1.0) * full_height as f64).round() as u32)
-        .min(full_height.saturating_sub(1));
-    let width = ((region.width.clamp(0.0, 1.0) * full_width as f64).round() as u32)
-        .max(1)
-        .min(full_width.saturating_sub(x));
-    let height = ((region.height.clamp(0.0, 1.0) * full_height as f64).round() as u32)
-        .max(1)
-        .min(full_height.saturating_sub(y));
-    let cropped = image::imageops::crop_imm(&captured.image, x, y, width, height).to_image();
-    let data_url = match image_data_url(&cropped) {
-        Ok(data_url) => data_url,
-        Err(error) => {
-            if let Some(main) = app.get_webview_window("main") {
-                let _ = main.show();
-                let _ = main.set_focus();
-            }
-            return Err(error);
+    let result = async {
+        window.hide().map_err(|error| error.to_string())?;
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.hide();
         }
+        let pending = state
+            .0
+            .lock()
+            .map_err(|_| "Capture state lock failed")?
+            .take();
+        let captured = if let Some(captured) = pending {
+            captured
+        } else {
+            tauri::async_runtime::spawn_blocking(|| {
+                thread::sleep(Duration::from_millis(100));
+                capture_desktop()
+            })
+            .await
+            .map_err(|error| format!("Screen capture task failed: {error}"))??
+        };
+        let full_width = captured.image.width();
+        let full_height = captured.image.height();
+        let x = ((region.x.clamp(0.0, 1.0) * full_width as f64).round() as u32)
+            .min(full_width.saturating_sub(1));
+        let y = ((region.y.clamp(0.0, 1.0) * full_height as f64).round() as u32)
+            .min(full_height.saturating_sub(1));
+        let width = ((region.width.clamp(0.0, 1.0) * full_width as f64).round() as u32)
+            .max(1)
+            .min(full_width.saturating_sub(x));
+        let height = ((region.height.clamp(0.0, 1.0) * full_height as f64).round() as u32)
+            .max(1)
+            .min(full_height.saturating_sub(y));
+        let cropped = image::imageops::crop_imm(&captured.image, x, y, width, height).to_image();
+        let data_url = image_data_url(&cropped)?;
+        let response = CaptureResponse {
+            data_url,
+            width,
+            height,
+        };
+        if let Some(main) = app.get_webview_window("main") {
+            main.show().map_err(|error| error.to_string())?;
+            main.set_focus().map_err(|error| error.to_string())?;
+            main.emit("capture-complete", &response)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(response)
     };
-    let response = CaptureResponse {
-        data_url,
-        width,
-        height,
-    };
-    if let Some(main) = app.get_webview_window("main") {
-        main.show().map_err(|error| error.to_string())?;
-        main.set_focus().map_err(|error| error.to_string())?;
-        main.emit("capture-complete", &response)
-            .map_err(|error| error.to_string())?;
+    let result = result.await;
+    match result {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if let Err(recovery_error) = recover_selection(&app, state.inner()) {
+                return Err(format!(
+                    "{error}; capture recovery failed: {recovery_error}"
+                ));
+            }
+            Err(error)
+        }
     }
-    Ok(response)
 }
 
 #[tauri::command]
 fn cancel_selection(app: AppHandle, state: tauri::State<'_, PendingCapture>) -> Result<(), String> {
-    *state.0.lock().map_err(|_| "Capture state lock failed")? = None;
-    if let Some(capture) = app.get_webview_window("capture") {
-        capture.hide().map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    recover_selection(&app, state.inner())
 }
 
-#[tauri::command]
+fn collapsed_prompt_height(composer_height: f64) -> f64 {
+    76.0 + (composer_height.clamp(42.0, 162.0) - 42.0)
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn set_prompt_expanded(
     window: WebviewWindow,
     expanded: bool,
     settings: bool,
+    composer_height: f64,
     state: tauri::State<'_, PromptWindowLayout>,
 ) -> Result<(), String> {
     let mut layout = state
@@ -1894,6 +2849,14 @@ fn set_prompt_expanded(
     let leaving_settings = layout.settings;
     layout.settings = false;
     if layout.expanded == expanded && !leaving_settings {
+        if !expanded {
+            window
+                .set_size(Size::Logical(tauri::LogicalSize::new(
+                    620.0,
+                    collapsed_prompt_height(composer_height),
+                )))
+                .map_err(|error| error.to_string())?;
+        }
         window
             .set_resizable(expanded)
             .map_err(|error| error.to_string())?;
@@ -1931,7 +2894,10 @@ fn set_prompt_expanded(
             .set_resizable(false)
             .map_err(|error| error.to_string())?;
         window
-            .set_size(Size::Logical(tauri::LogicalSize::new(620.0, 76.0)))
+            .set_size(Size::Logical(tauri::LogicalSize::new(
+                620.0,
+                collapsed_prompt_height(composer_height),
+            )))
             .map_err(|error| error.to_string())?;
     }
     layout.expanded = expanded;
@@ -1944,15 +2910,11 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
         .0
         .lock()
         .map_err(|_| "Settings state is unavailable")? = false;
-    *app.state::<ActiveSessionShortcut>()
-        .0
-        .lock()
-        .map_err(|_| "Session shortcut state is unavailable")? = None;
     if let Some(capture) = app.get_webview_window("capture") {
         capture.hide().map_err(|error| error.to_string())?;
     }
     if let Some(main) = app.get_webview_window("main") {
-        main.emit("clear-prompt", ())
+        main.emit("prompt-hidden", ())
             .map_err(|error| error.to_string())?;
         main.hide().map_err(|error| error.to_string())?;
     }
@@ -1960,9 +2922,7 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 }
 
 fn show_settings(app: &AppHandle) {
-    if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
-        *active = None;
-    }
+    let _ = clear_active_session_shortcut(app.state::<ActiveSessionShortcut>().inner());
     if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
         *open = true;
     }
@@ -2054,9 +3014,7 @@ fn show_prompt(app: &AppHandle) {
         } else if visible {
             let _ = window.set_focus();
         } else {
-            if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
-                *active = None;
-            }
+            let _ = clear_active_session_shortcut(app.state::<ActiveSessionShortcut>().inner());
             let _ = show_main_above_capture(&window);
             let _ = window.emit("open-prompt", ());
         }
@@ -2091,26 +3049,47 @@ fn tray_icon() -> Image<'static> {
 pub fn run() {
     let command_line = env::args_os().skip(1).collect::<Vec<_>>();
     let settings_config = SettingsConfigOverride(parse_settings_config_override(&command_line));
-    let prompt_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-    let registered_prompt_shortcut = prompt_shortcut;
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, pressed, event| {
+                .with_handler(|app, pressed, event| {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if pressed == &prompt_shortcut {
-                        show_prompt(app);
+                    let settings_open = app
+                        .state::<SettingsWindowState>()
+                        .0
+                        .lock()
+                        .map(|open| *open)
+                        .unwrap_or(true);
+                    if !should_dispatch_global_shortcut(settings_open) {
+                        return;
+                    }
+                    let action = app
+                        .state::<ShortcutConfigurationState>()
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|configuration| {
+                            configured_shortcut_action(&configuration, pressed.id())
+                        });
+                    match action {
+                        Some(ConfiguredShortcutAction::Prompt) => show_prompt(app),
+                        Some(ConfiguredShortcutAction::Session(session_id)) => {
+                            show_session_shortcut(app, &session_id)
+                        }
+                        None => {}
                     }
                 })
                 .build(),
         )
         .manage(PendingCapture::default())
         .manage(HermesBackend::default())
+        .manage(ActiveHermesTurns::default())
         .manage(SpeachesBackend::default())
         .manage(PreviousChatMenu::default())
-        .manage(SessionShortcutState::default())
+        .manage(ShortcutConfigurationState::default())
+        .manage(ShortcutUpdateState::default())
         .manage(SessionShortcutTrayState::default())
         .manage(settings_config)
         .manage(SettingsConfigWriteState::default())
@@ -2120,21 +3099,19 @@ pub fn run() {
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
+                if window.label() == "capture" {
+                    let app = window.app_handle();
+                    let pending = app.state::<PendingCapture>();
+                    let _ = recover_selection(app, pending.inner());
+                    return;
+                }
                 if window.label() == "main" {
-                    if let Ok(mut active) = window
-                        .app_handle()
-                        .state::<ActiveSessionShortcut>()
-                        .0
-                        .lock()
-                    {
-                        *active = None;
-                    }
                     if let Ok(mut open) =
                         window.app_handle().state::<SettingsWindowState>().0.lock()
                     {
                         *open = false;
                     }
-                    let _ = window.emit("clear-prompt", ());
+                    let _ = window.emit("prompt-hidden", ());
                 }
                 let _ = window.hide();
             }
@@ -2152,7 +3129,64 @@ pub fn run() {
                 None,
             ))?;
 
-            app.global_shortcut().register(registered_prompt_shortcut)?;
+            let configured = app.state::<SettingsConfigOverride>();
+            let default_profile = uses_default_settings_profile(&configured);
+            let central_path = settings_config_path(app.handle(), &configured).ok();
+            let central_load = central_path.as_deref().map(load_settings_from_path);
+            let central_settings = central_load
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|settings| settings.as_ref());
+            let central_prompt_shortcut = central_settings
+                .and_then(|settings| settings.values.get(PROMPT_SHORTCUT_SETTING_KEY))
+                .map(String::as_str);
+            let legacy_prompt_shortcut =
+                valid_legacy_prompt_shortcut(app.handle(), &configured, central_settings);
+            let startup_prompt = choose_startup_prompt_shortcut(
+                central_prompt_shortcut,
+                legacy_prompt_shortcut.as_deref(),
+                default_profile,
+            );
+            let validated = validate_shortcut_configuration(&startup_prompt.shortcut, &[]);
+            let migrate_registered_legacy =
+                startup_prompt.source == PromptShortcutSource::Legacy && validated.is_ok();
+            let mut initial = validated.unwrap_or_else(|_| ActiveShortcutConfiguration::default());
+            initial.registered.clear();
+            let requested = initial.prompt;
+            let requested_registered = app.global_shortcut().register(requested).is_ok();
+            if requested_registered {
+                initial.registered.insert(requested.id(), requested);
+            } else if initial.prompt_shortcut != DEFAULT_PROMPT_SHORTCUT {
+                let mut fallback = ActiveShortcutConfiguration::default();
+                let default_shortcut = fallback.prompt;
+                if app.global_shortcut().register(default_shortcut).is_ok() {
+                    fallback
+                        .registered
+                        .insert(default_shortcut.id(), default_shortcut);
+                }
+                initial = fallback;
+            }
+            if migrate_registered_legacy && requested_registered {
+                if let (Some(path), Some(settings)) = (central_path.as_deref(), central_settings) {
+                    if matches!(
+                        migrate_legacy_prompt_shortcut_to_settings(
+                            path,
+                            settings,
+                            &startup_prompt.shortcut,
+                        ),
+                        Ok(true)
+                    ) {
+                        if let Ok(legacy_path) = prompt_shortcut_config_path(app.handle()) {
+                            let _ = remove_legacy_prompt_shortcut_from_path(&legacy_path);
+                        }
+                    }
+                }
+            }
+            let initial_prompt_shortcut = initial.prompt_shortcut.clone();
+            *app.state::<ShortcutConfigurationState>()
+                .0
+                .lock()
+                .expect("shortcut configuration state") = initial;
 
             let show = MenuItem::with_id(app, "show", "Open Ask Hermes", true, None::<&str>)?;
             let previous =
@@ -2186,18 +3220,18 @@ pub fn run() {
                 tray.menu = Some(menu.clone());
                 tray.submenu = Some(session_shortcuts.clone());
             }
-            TrayIconBuilder::new()
+            TrayIconBuilder::with_id(TRAY_ICON_ID)
                 .icon(tray_icon())
-                .tooltip("Ask Hermes — Alt+Space")
+                .tooltip(format!("Ask Hermes — {initial_prompt_shortcut}"))
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     let item_id = event.id().as_ref();
                     match item_id {
                         "show" => show_prompt(app),
                         "previous" => {
-                            if let Ok(mut active) = app.state::<ActiveSessionShortcut>().0.lock() {
-                                *active = None;
-                            }
+                            let _ = clear_active_session_shortcut(
+                                app.state::<ActiveSessionShortcut>().inner(),
+                            );
                             if let Ok(mut open) = app.state::<SettingsWindowState>().0.lock() {
                                 *open = false;
                             }
@@ -2235,13 +3269,16 @@ pub fn run() {
             configure_hermes_instance,
             load_settings,
             save_settings,
-            set_session_shortcuts,
+            set_shortcuts,
+            get_shortcut_snapshot,
             get_voice_input_config,
             transcribe_voice_audio,
             get_speaches_status,
             ensure_speaches,
             ask_hermes_gateway,
+            cancel_hermes_turn,
             set_previous_chat_available,
+            clear_session_shortcut_context,
             start_selection,
             show_prepared_selection,
             capture_region,
@@ -2284,6 +3321,161 @@ mod tests {
         assert!(separated.is_absolute());
         assert_eq!(separated, joined);
         assert!(parse_settings_config_override(&["--config".into()]).is_err());
+    }
+
+    #[test]
+    fn legacy_prompt_shortcut_only_routes_through_default_profile() {
+        assert!(uses_default_settings_profile(&SettingsConfigOverride(Ok(
+            None
+        ))));
+        assert!(!uses_default_settings_profile(&SettingsConfigOverride(Ok(
+            Some(PathBuf::from("profile.json"))
+        ))));
+        assert!(!uses_default_settings_profile(&SettingsConfigOverride(
+            Err("invalid override".to_string())
+        )));
+
+        assert_eq!(
+            choose_startup_prompt_shortcut(None, Some("Ctrl+Alt+H"), true),
+            StartupPromptShortcut {
+                shortcut: "Ctrl+Alt+H".to_string(),
+                source: PromptShortcutSource::Legacy,
+            }
+        );
+        assert_eq!(
+            choose_startup_prompt_shortcut(None, Some("Ctrl+Alt+H"), false),
+            StartupPromptShortcut {
+                shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+                source: PromptShortcutSource::Default,
+            }
+        );
+    }
+
+    #[test]
+    fn settings_profile_keys_are_stable_and_isolated() {
+        let first_path = env::temp_dir().join("ask-hermes-profile-a/settings.json");
+        let second_path = env::temp_dir().join("ask-hermes-profile-b/settings.json");
+        let first = SettingsConfigOverride(Ok(Some(first_path.clone())));
+        let same = SettingsConfigOverride(Ok(Some(first_path)));
+        let second = SettingsConfigOverride(Ok(Some(second_path)));
+        let default = SettingsConfigOverride(Ok(None));
+
+        let first_key = settings_profile_key(&first).unwrap();
+        assert_eq!(first_key, settings_profile_key(&same).unwrap());
+        assert_ne!(first_key, settings_profile_key(&second).unwrap());
+        assert_ne!(first_key, settings_profile_key(&default).unwrap());
+        assert_eq!(
+            settings_profile_key(&default).unwrap(),
+            DEFAULT_SETTINGS_PROFILE_KEY
+        );
+        assert!(!first_key.contains("ask-hermes-profile-a"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn settings_profile_key_normalizes_windows_path_case() {
+        let lower = SettingsConfigOverride(Ok(Some(PathBuf::from(
+            r"C:\Users\alice\Ask Hermes\settings.json",
+        ))));
+        let upper = SettingsConfigOverride(Ok(Some(PathBuf::from(
+            r"c:\USERS\ALICE\ASK HERMES\SETTINGS.JSON",
+        ))));
+        assert_eq!(
+            settings_profile_key(&lower).unwrap(),
+            settings_profile_key(&upper).unwrap()
+        );
+    }
+
+    #[test]
+    fn central_prompt_shortcut_takes_precedence_over_legacy() {
+        assert_eq!(
+            choose_startup_prompt_shortcut(Some("Shift+F8"), Some("Ctrl+Alt+H"), true,),
+            StartupPromptShortcut {
+                shortcut: "Shift+F8".to_string(),
+                source: PromptShortcutSource::Central,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_prompt_shortcut_migration_preserves_central_settings() {
+        let path = temporary_settings_path("legacy-prompt-migration");
+        let central = PersistedSettings {
+            version: 1,
+            values: HashMap::from([
+                ("ask-hermes.model".to_string(), "gpt-5.2".to_string()),
+                ("ask-hermes.fast-mode".to_string(), "true".to_string()),
+            ]),
+        };
+
+        assert!(
+            migrate_legacy_prompt_shortcut_to_settings(&path, &central, "Ctrl+Alt+H",).unwrap()
+        );
+        let migrated = load_settings_from_path(&path).unwrap().unwrap();
+        assert_eq!(
+            migrated.values.get("ask-hermes.model"),
+            Some(&"gpt-5.2".to_string())
+        );
+        assert_eq!(
+            migrated.values.get("ask-hermes.fast-mode"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            migrated.values.get(PROMPT_SHORTCUT_SETTING_KEY),
+            Some(&"Ctrl+Alt+H".to_string())
+        );
+        assert!(
+            !migrate_legacy_prompt_shortcut_to_settings(&path, &migrated, "Shift+F8",).unwrap()
+        );
+        assert_eq!(load_settings_from_path(&path).unwrap(), Some(migrated));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_prompt_shortcut_file_validates_version_and_binding() {
+        let path = temporary_settings_path("legacy-prompt-file");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&PersistedPromptShortcut {
+                version: 1,
+                shortcut: " Ctrl+Alt+H ".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_persisted_prompt_shortcut_from_path(&path).unwrap(),
+            Some("Ctrl+Alt+H".to_string())
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_prompt_shortcut_cleanup_is_default_profile_only() {
+        let settings = PersistedSettings {
+            version: 1,
+            values: HashMap::from([(
+                PROMPT_SHORTCUT_SETTING_KEY.to_string(),
+                "Ctrl+Alt+H".to_string(),
+            )]),
+        };
+        assert!(should_cleanup_legacy_prompt_shortcut(
+            &SettingsConfigOverride(Ok(None)),
+            &settings,
+        ));
+        assert!(!should_cleanup_legacy_prompt_shortcut(
+            &SettingsConfigOverride(Ok(Some(PathBuf::from("profile.json")))),
+            &settings,
+        ));
+
+        let path = temporary_settings_path("legacy-prompt-cleanup");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"legacy").unwrap();
+        remove_legacy_prompt_shortcut_from_path(&path).unwrap();
+        assert!(!path.exists());
+        remove_legacy_prompt_shortcut_from_path(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -2365,8 +3557,8 @@ mod tests {
         if hermes_binary().is_err() {
             return;
         }
-        let backend =
-            start_hermes_backend().expect("Hermes gateway should announce its connection");
+        let backend = start_hermes_backend_with_cancel(None)
+            .expect("Hermes gateway should announce its connection");
         let url = reqwest::Url::parse(&backend.connection.http_url).unwrap();
         let address = format!(
             "{}:{}",
@@ -2477,6 +3669,327 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_parser_aliases_keep_registration_identity_stable() {
+        let active = validate_shortcut_configuration(
+            DEFAULT_PROMPT_SHORTCUT,
+            &[
+                SessionShortcutConfig {
+                    shortcut: "Alt+Super+Q".to_string(),
+                    session_id: "chat-q".to_string(),
+                },
+                SessionShortcutConfig {
+                    shortcut: "Alt+Super+E".to_string(),
+                    session_id: "chat-e".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        let reparsed = validate_shortcut_configuration(
+            "alt+Space",
+            &[
+                SessionShortcutConfig {
+                    shortcut: "super+alt+KeyQ".to_string(),
+                    session_id: "chat-q".to_string(),
+                },
+                SessionShortcutConfig {
+                    shortcut: "alt+super+KeyE".to_string(),
+                    session_id: "chat-e".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            "Alt+Super+E".parse::<Shortcut>().unwrap().to_string(),
+            "alt+super+KeyE"
+        );
+        let (additions, removals) = shortcut_registration_delta(&active, &reparsed);
+        assert!(additions.is_empty());
+        assert!(removals.is_empty());
+    }
+
+    #[test]
+    fn configurable_prompt_shortcut_reserves_only_its_current_binding() {
+        let conflict = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: "Ctrl+Alt+H".to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(conflict.contains("Open Ask Hermes"));
+
+        let moved = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let old_default = DEFAULT_PROMPT_SHORTCUT.parse::<Shortcut>().unwrap();
+        assert_eq!(
+            configured_shortcut_action(&moved, old_default.id()),
+            Some(ConfiguredShortcutAction::Session("chat-a".to_string()))
+        );
+        assert!(validate_shortcut_configuration("H", &[]).is_err());
+    }
+
+    #[test]
+    fn prompt_and_session_shortcuts_can_swap_without_registration_churn() {
+        let active = validate_shortcut_configuration(
+            DEFAULT_PROMPT_SHORTCUT,
+            &[SessionShortcutConfig {
+                shortcut: "Ctrl+Alt+H".to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let next = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let (additions, removals) = shortcut_registration_delta(&active, &next);
+        assert!(additions.is_empty());
+        assert!(removals.is_empty());
+        assert_eq!(
+            configured_shortcut_action(&next, next.prompt.id()),
+            Some(ConfiguredShortcutAction::Prompt)
+        );
+    }
+
+    #[test]
+    fn failed_prompt_registration_keeps_previous_configuration_active() {
+        let mut active = validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap();
+        let previous_id = active.prompt.id();
+        let next = validate_shortcut_configuration("Ctrl+Alt+H", &[]).unwrap();
+        let register_attempts = std::cell::RefCell::new(Vec::new());
+        let unregister_attempts = std::cell::RefCell::new(Vec::new());
+
+        let error = replace_registered_shortcuts_with(
+            &mut active,
+            next,
+            |shortcut| {
+                register_attempts.borrow_mut().push(shortcut.id());
+                Err("already registered by another application".to_string())
+            },
+            |shortcut| {
+                unregister_attempts.borrow_mut().push(shortcut.id());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("already registered"));
+        assert_eq!(active.prompt.id(), previous_id);
+        assert_eq!(register_attempts.borrow().len(), 1);
+        assert!(unregister_attempts.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_registration_rollback_tracks_leaked_binding_for_retry() {
+        let mut active = validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap();
+        let original_prompt_id = active.prompt.id();
+        let next = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: "Shift+F8".to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let registration_count = std::cell::Cell::new(0);
+        let leaked_id = std::cell::Cell::new(None);
+
+        let error = replace_registered_shortcuts_with(
+            &mut active,
+            next,
+            |shortcut| {
+                let attempt = registration_count.get();
+                registration_count.set(attempt + 1);
+                if attempt == 0 {
+                    leaked_id.set(Some(shortcut.id()));
+                    Ok(())
+                } else {
+                    Err("second registration failed".to_string())
+                }
+            },
+            |_| Err("rollback unregister failed".to_string()),
+        )
+        .unwrap_err();
+
+        let leaked_id = leaked_id.get().unwrap();
+        assert!(error.contains("second registration failed"));
+        assert_eq!(active.prompt.id(), original_prompt_id);
+        assert!(active.registered.contains_key(&leaked_id));
+
+        let cleanup_attempts = std::cell::RefCell::new(Vec::new());
+        replace_registered_shortcuts_with(
+            &mut active,
+            validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap(),
+            |_| Ok(()),
+            |shortcut| {
+                cleanup_attempts.borrow_mut().push(shortcut.id());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*cleanup_attempts.borrow(), &[leaked_id]);
+        assert_eq!(active.registered.len(), 1);
+    }
+
+    #[test]
+    fn failed_shortcut_update_commits_leaked_binding_to_shared_state() {
+        let active = validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap();
+        let original_prompt_id = active.prompt.id();
+        let state = ShortcutConfigurationState(Mutex::new(active));
+        let next = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: "Shift+F8".to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let registration_count = std::cell::Cell::new(0);
+        let leaked_id = std::cell::Cell::new(None);
+
+        let error = replace_registered_shortcuts_in_state_with(
+            &state,
+            next,
+            |_| false,
+            |shortcut| {
+                let attempt = registration_count.get();
+                registration_count.set(attempt + 1);
+                if attempt == 0 {
+                    leaked_id.set(Some(shortcut.id()));
+                    Ok(())
+                } else {
+                    Err("second registration failed".to_string())
+                }
+            },
+            |_| Err("rollback unregister failed".to_string()),
+        )
+        .unwrap_err();
+
+        let leaked_id = leaked_id.get().unwrap();
+        assert!(error.contains("second registration failed"));
+        {
+            let shared = state.0.lock().unwrap();
+            assert_eq!(shared.prompt.id(), original_prompt_id);
+            assert!(shared.registered.contains_key(&leaked_id));
+        }
+
+        let cleanup_attempts = std::cell::RefCell::new(Vec::new());
+        replace_registered_shortcuts_in_state_with(
+            &state,
+            validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap(),
+            |_| false,
+            |_| Ok(()),
+            |shortcut| {
+                cleanup_attempts.borrow_mut().push(shortcut.id());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*cleanup_attempts.borrow(), &[leaked_id]);
+        assert_eq!(state.0.lock().unwrap().registered.len(), 1);
+    }
+
+    #[test]
+    fn desired_app_owned_bindings_are_reconciled_before_registration() {
+        let state = ShortcutConfigurationState(Mutex::new(
+            validate_shortcut_configuration(DEFAULT_PROMPT_SHORTCUT, &[]).unwrap(),
+        ));
+        let next = validate_shortcut_configuration(
+            DEFAULT_PROMPT_SHORTCUT,
+            &[
+                SessionShortcutConfig {
+                    shortcut: "Alt+Super+Q".to_string(),
+                    session_id: "chat-q".to_string(),
+                },
+                SessionShortcutConfig {
+                    shortcut: "Alt+Super+E".to_string(),
+                    session_id: "chat-e".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        let app_owned = next.registered.clone();
+        let registration_attempts = std::cell::RefCell::new(Vec::new());
+
+        let applied = replace_registered_shortcuts_in_state_with(
+            &state,
+            next,
+            |shortcut| app_owned.contains_key(&shortcut.id()),
+            |shortcut| {
+                registration_attempts.borrow_mut().push(shortcut.id());
+                Err("already registered".to_string())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert!(registration_attempts.borrow().is_empty());
+        assert_eq!(applied.registered.len(), 3);
+        assert_eq!(applied.session_shortcuts.len(), 2);
+        assert_eq!(state.0.lock().unwrap().registered.len(), 3);
+    }
+
+    #[test]
+    fn rejects_shortcuts_reserved_by_focused_window_actions() {
+        for shortcut in ["Ctrl+Shift+D", "Shift+Ctrl+D", "Ctrl+N"] {
+            let prompt_error = validate_shortcut_configuration(shortcut, &[]).unwrap_err();
+            assert!(prompt_error.contains("conflicts"));
+
+            let session_error = validate_shortcut_configuration(
+                "Ctrl+Alt+H",
+                &[SessionShortcutConfig {
+                    shortcut: shortcut.to_string(),
+                    session_id: "chat-a".to_string(),
+                }],
+            )
+            .unwrap_err();
+            assert!(session_error.contains("conflicts"));
+        }
+    }
+
+    #[test]
+    fn shortcut_snapshot_reports_applied_registration_state() {
+        let mut configuration = validate_shortcut_configuration(
+            "Ctrl+Alt+H",
+            &[SessionShortcutConfig {
+                shortcut: DEFAULT_PROMPT_SHORTCUT.to_string(),
+                session_id: "chat-a".to_string(),
+            }],
+        )
+        .unwrap();
+        let snapshot = shortcut_snapshot(&configuration);
+        assert_eq!(snapshot.prompt_shortcut, "Ctrl+Alt+H");
+        assert!(snapshot.prompt_registered);
+        assert_eq!(snapshot.shortcuts, configuration.session_shortcuts);
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap()["promptRegistered"],
+            true
+        );
+
+        configuration.registered.clear();
+        assert!(!shortcut_snapshot(&configuration).prompt_registered);
+    }
+
+    #[test]
+    fn collapsed_prompt_height_tracks_bounded_composer_height() {
+        assert_eq!(collapsed_prompt_height(42.0), 76.0);
+        assert_eq!(collapsed_prompt_height(90.0), 124.0);
+        assert_eq!(collapsed_prompt_height(500.0), 196.0);
+    }
+
+    #[test]
     fn accepts_existing_hermes_instance_addresses() {
         assert_eq!(
             validate_hermes_address(&HermesInstanceConfig {
@@ -2540,6 +4053,122 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_cancellation_is_exchange_scoped() {
+        let turns = ActiveHermesTurns::default();
+        let (guard, _cancel, receiver) = turns.begin("exchange-1".to_string()).unwrap();
+
+        assert!(!turns.cancel("exchange-2").unwrap());
+        assert!(!*receiver.borrow());
+        assert!(turns.cancel("exchange-1").unwrap());
+        assert!(*receiver.borrow());
+
+        drop(guard);
+        assert!(!turns.cancel("exchange-1").unwrap());
+    }
+
+    #[test]
+    fn replaced_turn_guard_does_not_remove_new_turn() {
+        let turns = ActiveHermesTurns::default();
+        let (old_guard, _old_cancel, old_receiver) = turns.begin("exchange-1".to_string()).unwrap();
+        let (new_guard, _new_cancel, new_receiver) = turns.begin("exchange-1".to_string()).unwrap();
+
+        assert!(*old_receiver.borrow());
+        assert!(!*new_receiver.borrow());
+        drop(old_guard);
+        assert!(turns.cancel("exchange-1").unwrap());
+        assert!(*new_receiver.borrow());
+        drop(new_guard);
+    }
+
+    #[test]
+    fn cancellation_before_turn_registration_is_consumed() {
+        let turns = ActiveHermesTurns::default();
+        assert!(!turns.cancel("exchange-late").unwrap());
+
+        let (guard, _cancel, receiver) = turns.begin("exchange-late".to_string()).unwrap();
+        assert!(*receiver.borrow());
+        drop(guard);
+
+        let (guard, _cancel, receiver) = turns.begin("exchange-late".to_string()).unwrap();
+        assert!(!*receiver.borrow());
+        drop(guard);
+    }
+
+    #[test]
+    fn expired_and_excess_cancel_tombstones_are_pruned() {
+        let turns = ActiveHermesTurns::default();
+        {
+            let mut state = turns.0.state.lock().unwrap();
+            state.pending_cancellations.insert(
+                "expired".to_string(),
+                StdInstant::now() - HERMES_CANCEL_TOMBSTONE_TTL - Duration::from_secs(1),
+            );
+        }
+        let (guard, _cancel, receiver) = turns.begin("expired".to_string()).unwrap();
+        assert!(!*receiver.borrow());
+        drop(guard);
+
+        for index in 0..(HERMES_CANCEL_TOMBSTONE_LIMIT + 20) {
+            assert!(!turns.cancel(&format!("missing-{index}")).unwrap());
+        }
+        assert!(
+            turns.0.state.lock().unwrap().pending_cancellations.len()
+                <= HERMES_CANCEL_TOMBSTONE_LIMIT
+        );
+    }
+
+    #[test]
+    fn startup_wait_reports_cancellation_and_timeout_codes() {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let (cancel, _watch) = TurnCancelHandle::new();
+        cancel.cancel();
+        assert_eq!(
+            wait_for_hermes_startup(&receiver, Some(&cancel), Duration::from_secs(1)),
+            Err(HERMES_TURN_CANCELLED.to_string())
+        );
+
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        assert_eq!(
+            wait_for_hermes_startup(&receiver, None, Duration::from_millis(1)),
+            Err("HERMES_TIMEOUT:startup".to_string())
+        );
+    }
+
+    #[test]
+    fn cancelled_backend_lock_wait_exits_without_acquiring_mutex() {
+        let backend = HermesBackend::default();
+        let held = backend.0.state.lock().unwrap();
+        let worker_backend = backend.clone();
+        let (cancel, _receiver) = TurnCancelHandle::new();
+        let worker_cancel = cancel.clone();
+        let worker = thread::spawn(move || {
+            lock_hermes_backend_state(&worker_backend, Some(&worker_cancel))
+                .map(|_| ())
+                .unwrap_err()
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        cancel.cancel();
+        assert_eq!(worker.join().unwrap(), HERMES_TURN_CANCELLED);
+        drop(held);
+    }
+
+    #[test]
+    fn operation_deadline_uses_nearest_budget() {
+        let now = TokioInstant::now();
+        let overall = now + Duration::from_secs(2);
+        let (deadline, phase) =
+            turn_operation_deadline(now, Duration::from_secs(1), overall, "rpc");
+        assert_eq!(deadline, now + Duration::from_secs(1));
+        assert_eq!(phase, "rpc");
+
+        let (deadline, phase) =
+            turn_operation_deadline(now, Duration::from_secs(3), overall, "rpc");
+        assert_eq!(deadline, overall);
+        assert_eq!(phase, "overall");
+    }
+
+    #[test]
     fn accepts_nested_frontend_turn_request() {
         let request: HermesTurnRequest = serde_json::from_value(json!({
             "exchangeId": "exchange-1",
@@ -2581,5 +4210,18 @@ mod tests {
             "chat-a"
         ));
         assert!(!should_hide_session_shortcut(true, None, "chat-a"));
+    }
+
+    #[test]
+    fn settings_recorder_suppresses_global_shortcut_dispatch() {
+        assert!(should_dispatch_global_shortcut(false));
+        assert!(!should_dispatch_global_shortcut(true));
+    }
+
+    #[test]
+    fn explicit_session_shortcut_context_clear_removes_active_session() {
+        let state = ActiveSessionShortcut(Mutex::new(Some("chat-a".to_string())));
+        clear_active_session_shortcut(&state).unwrap();
+        assert!(state.0.lock().unwrap().is_none());
     }
 }

@@ -57,6 +57,24 @@ export function shortcutFromKeyboardEvent(event: ShortcutKeyboardEvent) {
   return [...modifiers, key].join('+')
 }
 
+export function shouldPreserveSessionShortcutContext(
+  requestedSessionId: string,
+  activeSessionId: string,
+  hasMeaningfulState: boolean,
+) {
+  return hasMeaningfulState && requestedSessionId === activeSessionId
+}
+
+export function shortcutTextsMatch(left: string, right: string) {
+  const normalize = (value: string) => value
+    .split('+')
+    .map(part => part.trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join('+')
+  return normalize(left) === normalize(right)
+}
+
 export function transcriptFromMessages(messages: HistoryMessage[]): Exchange[] {
   const exchanges: Exchange[] = []
   for (const message of messages) {

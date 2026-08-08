@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { NEW_SESSION, newSessionSetting, normalizeSelection, sourceRect } from './selection'
+import { NEW_SESSION, newSessionSetting, normalizeSelection, sessionPreferenceForRouting, sourceRect } from './selection'
 
 describe('normalizeSelection', () => {
   const sessions = [{ id: 'latest' }, { id: 'older' }]
@@ -25,6 +25,13 @@ describe('newSessionSetting', () => {
   it('applies a model or effort only while creating a new session', () => {
     expect(newSessionSetting(NEW_SESSION, 'low')).toBe('low')
     expect(newSessionSetting('existing-session', 'low')).toBeNull()
+  })
+})
+
+describe('sessionPreferenceForRouting', () => {
+  it('routes safely to a new session until stored sessions are validated', () => {
+    expect(sessionPreferenceForRouting('possibly-stale', false)).toBe(NEW_SESSION)
+    expect(sessionPreferenceForRouting('validated-session', true)).toBe('validated-session')
   })
 })
 

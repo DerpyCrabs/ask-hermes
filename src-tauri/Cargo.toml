@@ -25,7 +25,7 @@ chrono = "0.4.45"
 rand = "0.10.2"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.33"
-tokio = { version = "1.53.0", features = ["io-util"] }
+tokio = { version = "1.53.0", features = ["io-util", "macros", "rt", "sync", "time"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]

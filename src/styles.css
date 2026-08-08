@@ -50,6 +50,8 @@ button { color: inherit; }
   flex: 1 1 auto;
   min-width: 90px;
   height: 42px;
+  min-height: 42px;
+  max-height: 162px;
   resize: none;
   border: 0;
   outline: 0;
@@ -64,7 +66,7 @@ button { color: inherit; }
 
 .composer textarea::placeholder, .overlay-composer textarea::placeholder { color: #7b8190; }
 
-.voice-button, .capture-button, .send-button {
+.voice-button, .capture-button, .send-button, .stop-button {
   width: 38px;
   height: 38px;
   flex: 0 0 auto;
@@ -75,7 +77,7 @@ button { color: inherit; }
   cursor: pointer;
 }
 
-.voice-button svg, .capture-button svg, .send-button svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.voice-button svg, .capture-button svg, .send-button svg, .stop-button svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 .voice-button { color: #fff; background: #0053fd; }
 .voice-button:hover { background: #0049df; }
@@ -84,7 +86,9 @@ button { color: inherit; }
 .capture-button { color: #0053fd; background: rgba(0,83,253,.07); font-size: 19px; }
 .capture-button:hover { background: rgba(0,83,253,.13); }
 .send-button { color: #fff; background: #0053fd; font-size: 18px; font-weight: 700; }
-.send-button:disabled, .capture-button:disabled, .voice-button:disabled { opacity: .35; cursor: default; }
+.stop-button { color: #fff; background: #d52b4c; }
+.stop-button:hover { background: #bd2341; }
+.send-button:disabled, .capture-button:disabled, .voice-button:disabled, .stop-button:disabled { opacity: .35; cursor: default; }
 .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
 .capture-spinner { width: 14px; height: 14px; flex: 0 0 auto; border: 2px solid rgba(0,83,253,.22); border-top-color: #0053fd; border-radius: 50%; animation: spin .65s linear infinite; }
 .capture-button .capture-spinner { width: 17px; height: 17px; }
@@ -124,10 +128,13 @@ button { color: inherit; }
 .answer, .answer * { user-select: text; }
 .answer { color: #27272d; font-size: 13px; line-height: 1.55; white-space: pre-wrap; cursor: text; }
 .answer a { cursor: pointer; }
-.answer.failed { color: #a71f3b; }
+.turn-error { padding: 6px 8px; border: 1px solid rgba(199,46,77,.18); border-radius: 8px; background: #fff2f5; color: #a71f3b; font-size: 11px; }
 .answer-activity { min-width: 0; height: 22px; display: flex; align-items: center; gap: 7px; color: #747b8a; font-size: 11px; }
 .answer-activity svg { flex: 0 0 auto; color: #0053fd; stroke-width: 1.8; animation: spin .9s linear infinite; }
 .answer-activity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exchange-actions { min-height: 24px; display: flex; align-items: center; gap: 8px; color: #777d89; font-size: 11px; }
+.exchange-actions button { height: 24px; padding: 0 9px; border: 1px solid rgba(0,83,253,.17); border-radius: 7px; background: rgba(0,83,253,.055); color: #0053fd; font-size: 11px; cursor: pointer; }
+.exchange-actions button:disabled { opacity: .4; cursor: default; }
 .markdown { white-space: normal; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
@@ -173,12 +180,23 @@ button { color: inherit; }
 .settings-footer { flex: 0 0 auto; display: flex; justify-content: flex-end; padding-top: 10px; border-top: 1px solid rgba(0,83,253,.08); }
 .settings-error { flex: 0 0 auto; margin: 4px 0 2px; color: #c51f42; font-size: 11px; }
 .settings-save { height: 34px; padding: 0 18px; border: 0; border-radius: 9px; background: #0053fd; color: white; cursor: pointer; }
+.settings-save:disabled { opacity: .4; cursor: default; }
 .shortcut-settings { padding: 6px 4px; }
 .shortcut-settings-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
 .shortcut-settings-header h3 { margin: 0 0 2px; color: #292930; font-size: 12px; font-weight: 650; }
 .shortcut-settings-header button { height: 30px; padding: 0 11px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: rgba(0,83,253,.06); color: #0053fd; font-size: 11px; cursor: pointer; }
 .shortcut-settings-header button:disabled { opacity: .4; cursor: default; }
 .shortcut-empty { margin-top: 18px; padding: 30px 16px; border: 1px dashed rgba(0,83,253,.18); border-radius: 12px; color: #8a8f9d; text-align: center; font-size: 11px; }
+.prompt-shortcut-settings { padding-bottom: 17px; border-bottom: 1px solid rgba(0,83,253,.1); }
+.prompt-shortcut-settings .shortcut-settings-header { margin-bottom: 12px; }
+.prompt-shortcut-settings .shortcut-settings-header p { margin: 3px 0 0; }
+.session-shortcut-settings { padding-top: 18px; }
+.prompt-shortcut-row { display: grid; grid-template-columns: 128px minmax(0,1fr) auto; align-items: center; gap: 9px; color: #666678; font-size: 12px; }
+.prompt-shortcut-row label { display: block; margin: 0; }
+.prompt-shortcut-row input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid rgba(0,83,253,.16); border-radius: 8px; outline: 0; background: #fff; color: #363640; font-size: 11px; text-align: center; cursor: pointer; box-sizing: border-box; }
+.prompt-shortcut-row input:focus { border-color: rgba(0,83,253,.55); box-shadow: 0 0 0 2px rgba(0,83,253,.07); }
+.prompt-shortcut-row button { height: 30px; padding: 0 11px; border: 1px solid rgba(0,83,253,.18); border-radius: 8px; background: rgba(0,83,253,.06); color: #0053fd; font-size: 11px; cursor: pointer; }
+.prompt-shortcut-row button:disabled { opacity: .4; cursor: default; }
 .shortcut-row { display: grid; grid-template-columns: 128px minmax(0,1fr) 28px; align-items: center; gap: 9px; margin-top: 10px; }
 .shortcut-row input, .shortcut-row select { width: 100%; height: 34px; padding: 0 30px 0 9px; border: 1px solid rgba(0,83,253,.16); border-radius: 8px; outline: 0; background: #fff; color: #363640; font-size: 11px; }
 .shortcut-row input { padding: 0 9px; text-align: center; cursor: pointer; }

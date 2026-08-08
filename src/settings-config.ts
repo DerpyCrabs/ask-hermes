@@ -5,6 +5,7 @@ export const PERSISTENT_SETTING_KEYS = [
   'ask-hermes.model',
   'ask-hermes.reasoning-effort',
   'ask-hermes.fast-mode',
+  'ask-hermes.prompt-shortcut.v1',
   'ask-hermes.session-shortcuts.v1',
   'ask-hermes.voice-provider',
   'ask-hermes.speaches-force-english',
@@ -23,6 +24,15 @@ export type PersistedSettings = {
 type LoadedSettings = {
   settings: PersistedSettings | null
   migrateLocalStorage: boolean
+  legacyPromptShortcut: string | null
+  profileKey: string
+}
+
+const PROMPT_SHORTCUT_SETTING_KEY = 'ask-hermes.prompt-shortcut.v1'
+let hydratedSettingsProfileKey = 'default-v1'
+
+export function currentSettingsProfileKey() {
+  return hydratedSettingsProfileKey
 }
 
 export function settingsFromStorage(storage: Pick<Storage, 'getItem'>): PersistedSettings {
@@ -46,17 +56,43 @@ export function applySettingsToStorage(
   }
 }
 
+export function mergeLegacyPromptShortcut(
+  settings: PersistedSettings,
+  legacyPromptShortcut: string | null,
+): { settings: PersistedSettings; changed: boolean } {
+  if (
+    !legacyPromptShortcut
+    || Object.prototype.hasOwnProperty.call(settings.values, PROMPT_SHORTCUT_SETTING_KEY)
+  ) {
+    return { settings, changed: false }
+  }
+  return {
+    settings: {
+      version: 1,
+      values: {
+        ...settings.values,
+        [PROMPT_SHORTCUT_SETTING_KEY]: legacyPromptShortcut,
+      },
+    },
+    changed: true,
+  }
+}
+
 export async function hydratePersistentSettings(storage: Storage = localStorage) {
   const loaded = await invoke<LoadedSettings>('load_settings')
+  hydratedSettingsProfileKey = loaded.profileKey
   if (loaded.settings) {
-    applySettingsToStorage(loaded.settings, storage)
+    const merged = mergeLegacyPromptShortcut(loaded.settings, loaded.legacyPromptShortcut)
+    applySettingsToStorage(merged.settings, storage)
+    if (merged.changed) await invoke('save_settings', { settings: merged.settings })
     return
   }
   const initial = loaded.migrateLocalStorage
     ? settingsFromStorage(storage)
     : { version: 1 as const, values: {} }
-  if (!loaded.migrateLocalStorage) applySettingsToStorage(initial, storage)
-  await invoke('save_settings', { settings: initial })
+  const merged = mergeLegacyPromptShortcut(initial, loaded.legacyPromptShortcut)
+  applySettingsToStorage(merged.settings, storage)
+  await invoke('save_settings', { settings: merged.settings })
 }
 
 export function savePersistentSettings(settings: PersistedSettings) {

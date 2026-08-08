@@ -3,6 +3,7 @@ import { supportsFastMode } from './model-settings'
 
 describe('fast mode availability', () => {
   it('is offered for explicit GPT models', () => {
+    expect(supportsFastMode('gpt-5.6-luna')).toBe(true)
     expect(supportsFastMode('gpt-5.6-terra')).toBe(true)
     expect(supportsFastMode('GPT-5.6-sol')).toBe(true)
   })

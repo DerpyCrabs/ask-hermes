@@ -10,15 +10,16 @@ import ChevronDown from 'lucide-solid/icons/chevron-down'
 import ExternalLink from 'lucide-solid/icons/external-link'
 import LoaderCircle from 'lucide-solid/icons/loader-circle'
 import Mic from 'lucide-solid/icons/mic'
+import Plus from 'lucide-solid/icons/plus'
 import Square from 'lucide-solid/icons/square'
 import X from 'lucide-solid/icons/x'
-import { NEW_SESSION, normalizeSelection } from './selection'
+import { NEW_SESSION, normalizeSelection, sessionPreferenceForRouting } from './selection'
 import { appendCapture, clipboardImageFiles, imageFileToCapture, removeCaptureAt, type Capture } from './captures'
 import { renderMarkdown } from './markdown'
 import { autostartAction } from './autostart'
-import { runHermesTurn } from './hermes-gateway'
-import { appendAnswerDelta, beginExchange, finishExchange, type Exchange } from './conversation'
-import { shortcutFromKeyboardEvent, transcriptFromMessages, type HistoryMessage, type HistoryPage, type SessionShortcut } from './session-shortcuts'
+import { hermesTurnErrorMessage, isHermesTurnCancelled, runHermesTurn } from './hermes-gateway'
+import { appendAnswerDelta, beginExchange, failExchange, finishExchange, interruptExchange, retryExchange, type Exchange } from './conversation'
+import { shortcutFromKeyboardEvent, shortcutTextsMatch, shouldPreserveSessionShortcutContext, transcriptFromMessages, type HistoryMessage, type HistoryPage, type SessionShortcut } from './session-shortcuts'
 import { sessionsEqual, type SessionRecord } from './sessions'
 import { supportsFastMode } from './model-settings'
 import { formatTurnActivity } from './turn-activity'
@@ -26,7 +27,9 @@ import { shouldRememberPreviousChat } from './previous-chat'
 import { HermesRecording, HermesSilenceDetector, VoiceStartGate, blobToDataUrl, isVoiceInputShortcut, microphoneErrorMessage, normalizedVoiceLevel, preferredAudioMimeType, voiceInputTooltip, type VoiceInputStatus } from './voice-input'
 import { SpeachesRealtimeSession, speachesRealtimeUrl } from './speaches-realtime'
 import { buildHermesInstanceConfig } from './hermes-instance'
-import { savePersistentSettings, settingsFromStorage } from './settings-config'
+import { currentSettingsProfileKey, savePersistentSettings, settingsFromStorage } from './settings-config'
+import { composerDraftSessionId, composerDraftStorageKey, createComposerDraftStore } from './composer-draft'
+import { COMPOSER_MAX_HEIGHT, COMPOSER_MIN_HEIGHT, boundedComposerHeight } from './composer-height'
 import hermesIcon from '../src-tauri/icons/hermes-tray-source.png'
 
 type Session = SessionRecord
@@ -37,11 +40,24 @@ type VoiceConfig = { maxRecordingSeconds: number; sttEnabled: boolean }
 type VoiceTranscription = { transcript: string }
 type VoiceProvider = 'hermes' | 'speaches'
 type SpeachesStatus = { installed: boolean; running: boolean; model: string; websocketUrl: string }
+type ShortcutSnapshot = {
+  promptShortcut: string
+  promptRegistered: boolean
+  shortcuts: Array<{ shortcut: string; sessionId: string }>
+}
+type ActiveTurn = {
+  exchangeId: string
+  controller: AbortController
+  stopping: boolean
+  settled: Promise<void>
+  resolveSettled(): void
+}
 
 const SESSION_PREFERENCE_KEY = 'ask-hermes.session-preference.v2'
 const MODEL_KEY = 'ask-hermes.model'
 const EFFORT_KEY = 'ask-hermes.reasoning-effort'
 const FAST_KEY = 'ask-hermes.fast-mode'
+const PROMPT_SHORTCUT_KEY = 'ask-hermes.prompt-shortcut.v1'
 const SESSION_SHORTCUTS_KEY = 'ask-hermes.session-shortcuts.v1'
 const VOICE_PROVIDER_KEY = 'ask-hermes.voice-provider'
 const SPEACHES_ENGLISH_KEY = 'ask-hermes.speaches-force-english'
@@ -50,6 +66,7 @@ const HERMES_ADDRESS_KEY = 'ask-hermes.instance.address'
 const HERMES_PORT_KEY = 'ask-hermes.instance.port'
 const HERMES_REMOTE_KEY = 'ask-hermes.instance.remote'
 const HERMES_TOKEN_KEY = 'ask-hermes.instance.token'
+const DEFAULT_PROMPT_SHORTCUT = 'Alt+Space'
 
 function storedSessionShortcuts(): SessionShortcut[] {
   try {
@@ -60,15 +77,28 @@ function storedSessionShortcuts(): SessionShortcut[] {
   }
 }
 
+function storedPromptShortcut() {
+  return localStorage.getItem(PROMPT_SHORTCUT_KEY) || DEFAULT_PROMPT_SHORTCUT
+}
+
 function compactTime(timestamp: number) {
   if (!timestamp) return ''
   return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(timestamp * 1000))
 }
 
 function PromptWindow() {
+  const draftStore = createComposerDraftStore(
+    localStorage,
+    composerDraftStorageKey(currentSettingsProfileKey()),
+  )
+  const restoredDraft = draftStore.load()
   let inputRef: HTMLTextAreaElement | undefined
   let conversationRef: HTMLDivElement | undefined
   let promptGeneration = 0
+  let contextTransition = 0
+  let sessionSelectionValidated = false
+  let pendingDraftSession = restoredDraft?.sessionId
+  let activeTurn: ActiveTurn | undefined
   let openedFromSessionShortcut = false
   let hermesRecording: HermesRecording | undefined
   let voiceStartedAt = 0
@@ -86,14 +116,18 @@ function PromptWindow() {
   const [sessionPreference, setSessionPreference] = createSignal(
     localStorage.getItem(SESSION_PREFERENCE_KEY) || NEW_SESSION,
   )
-  const [activeSession, setActiveSession] = createSignal(sessionPreference())
+  const [activeSession, setActiveSession] = createSignal(NEW_SESSION)
+  const [sessionsReady, setSessionsReady] = createSignal(false)
   const [runtimeSession, setRuntimeSession] = createSignal<string>()
-  const [prompt, setPrompt] = createSignal('')
+  const [prompt, setPrompt] = createSignal(restoredDraft?.text || '')
+  const [composerHeight, setComposerHeight] = createSignal(COMPOSER_MIN_HEIGHT)
   const [captures, setCaptures] = createSignal<Capture[]>([])
   const [preview, setPreview] = createSignal<Capture>()
   const [history, setHistory] = createSignal<Exchange[]>([])
   const [previousChat, setPreviousChat] = createSignal<PreviousChat>()
   const [busy, setBusy] = createSignal(false)
+  const [stopping, setStopping] = createSignal(false)
+  const [contextChanging, setContextChanging] = createSignal(false)
   const [turnActivities, setTurnActivities] = createSignal<Record<string, string>>({})
   const [capturing, setCapturing] = createSignal(false)
   const [settingsOpen, setSettingsOpen] = createSignal(false)
@@ -102,6 +136,7 @@ function PromptWindow() {
   const [effort, setEffort] = createSignal(localStorage.getItem(EFFORT_KEY) || 'low')
   const [fastMode, setFastMode] = createSignal(localStorage.getItem(FAST_KEY) === 'true')
   const [startAtLogin, setStartAtLogin] = createSignal(false)
+  const [promptShortcut, setPromptShortcut] = createSignal(storedPromptShortcut())
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(storedSessionShortcuts())
   const [pagedMessages, setPagedMessages] = createSignal<HistoryMessage[]>([])
   const [pagedSession, setPagedSession] = createSignal<string>()
@@ -134,10 +169,16 @@ function PromptWindow() {
     hermesPort(),
     hermesToken(),
   )
+  const safePreferredSession = () => sessionPreferenceForRouting(
+    sessionPreference(),
+    sessionSelectionValidated,
+  )
 
   const loadSessions = async () => {
     try {
       const list = await invoke<Session[]>('list_sessions')
+      const firstValidatedLoad = !sessionSelectionValidated
+      sessionSelectionValidated = true
       let changed = false
       setSessions(current => {
         if (sessionsEqual(current, list)) return current
@@ -158,12 +199,41 @@ function PromptWindow() {
       const normalized = normalizeSelection(sessionPreference(), list)
       if (normalized !== sessionPreference()) {
         setSessionPreference(normalized)
-        setActiveSession(normalized)
-        setRuntimeSession(undefined)
         localStorage.setItem(SESSION_PREFERENCE_KEY, normalized)
+        if (!firstValidatedLoad
+          && !busy()
+          && history().length === 0
+          && !prompt()
+          && captures().length === 0
+          && !loadingSessionHistory()) {
+          setActiveSession(normalized)
+          setRuntimeSession(undefined)
+        }
+      }
+      if (firstValidatedLoad) {
+        const draftSession = pendingDraftSession
+        pendingDraftSession = undefined
+        if (!openedFromSessionShortcut && history().length === 0 && !loadingSessionHistory()) {
+          const text = prompt()
+          const selectedSession = draftSession && text
+            ? normalizeSelection(draftSession, list)
+            : normalized
+          setActiveSession(selectedSession)
+          setRuntimeSession(undefined)
+          draftStore.save(text ? { sessionId: selectedSession, text } : undefined)
+        }
+        setSessionsReady(true)
       }
     } catch (reason) {
       setError(String(reason))
+      if (!sessionsReady()) {
+        // Session listing can fail independently from gateway turns. Enable a
+        // safe new-session path; a later successful refresh still validates
+        // and restores the pending draft selection.
+        setActiveSession(NEW_SESSION)
+        setRuntimeSession(undefined)
+        setSessionsReady(true)
+      }
     }
   }
 
@@ -171,6 +241,25 @@ function PromptWindow() {
     const scroll = () => conversationRef?.scrollTo({ top: conversationRef.scrollHeight })
     window.requestAnimationFrame(() => window.requestAnimationFrame(scroll))
     window.setTimeout(scroll, 120)
+  }
+
+  const resizeComposer = () => {
+    const input = inputRef
+    if (!input) return
+    input.style.height = `${COMPOSER_MIN_HEIGHT}px`
+    const measured = input.scrollHeight
+    const height = boundedComposerHeight(measured)
+    input.style.height = `${height}px`
+    input.style.overflowY = measured > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden'
+    setComposerHeight(height)
+  }
+
+  const syncPromptLayout = () => {
+    void invoke('set_prompt_expanded', {
+      expanded: history().length > 0 || loadingSessionHistory() || Boolean(preview()) || settingsOpen(),
+      settings: settingsOpen(),
+      composerHeight: composerHeight(),
+    }).catch(reason => setError(String(reason)))
   }
 
   const clearVoiceTimers = () => {
@@ -405,7 +494,7 @@ function PromptWindow() {
   }
 
   const startVoiceInput = async () => {
-    if (voiceStatus() !== 'idle' || prompt().trim() || busy() || capturing()) return
+    if (voiceStatus() !== 'idle' || prompt().trim() || busy() || contextChanging() || capturing()) return
     const generation = voiceGeneration + 1
     if (!voiceStartGate.tryStart(generation)) return
     voiceGeneration = generation
@@ -434,33 +523,255 @@ function PromptWindow() {
     else if (voiceStatus() === 'idle') void startVoiceInput()
   }
 
-  const clearPrompt = () => {
+  const clearTurnActivity = (exchangeId: string) => {
+    setTurnActivities(items => {
+      const next = { ...items }
+      delete next[exchangeId]
+      return next
+    })
+  }
+
+  const stopActiveTurn = async () => {
+    const turn = activeTurn
+    if (!turn) return false
+    if (!turn.stopping) {
+      // Abort listeners flush buffered deltas synchronously while this turn is
+      // still current. Mark it stopping only after that partial tail is saved.
+      turn.controller.abort()
+      turn.stopping = true
+      setHistory(items => interruptExchange(items, turn.exchangeId))
+      clearTurnActivity(turn.exchangeId)
+      setStopping(true)
+    }
+    await turn.settled
+    return true
+  }
+
+  const clearPrompt = async (preserveComposer = false) => {
+    const transition = ++contextTransition
+    setContextChanging(true)
     cancelVoiceInput()
+    await stopActiveTurn()
+    if (transition !== contextTransition) return
+    let contextError = ''
+    try {
+      await invoke('clear_session_shortcut_context')
+    } catch (reason) {
+      contextError = `Could not clear session shortcut context: ${String(reason)}`
+    }
+    if (transition !== contextTransition) return
     const transcript = history()
     if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
       setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
       void invoke('set_previous_chat_available', { available: true })
     }
     openedFromSessionShortcut = false
+    pendingDraftSession = undefined
     promptGeneration += 1
-    setPrompt('')
-    setCaptures([])
+    if (!preserveComposer) {
+      setPrompt('')
+      setCaptures([])
+    }
     setPreview(undefined)
     setHistory([])
     setBusy(false)
+    setStopping(false)
     setTurnActivities({})
     setCapturing(false)
     setSettingsOpen(false)
-    setActiveSession(sessionPreference())
+    const preferredSession = safePreferredSession()
+    setActiveSession(preferredSession)
     setRuntimeSession(undefined)
     setPagedMessages([])
     setPagedSession(undefined)
     setHasOlderMessages(false)
+    setLoadingOlderMessages(false)
     setLoadingSessionHistory(false)
+    setError(contextError)
+    setContextChanging(false)
+    if (preserveComposer) {
+      const text = prompt()
+      draftStore.save(text ? { sessionId: preferredSession, text } : undefined)
+    }
+  }
+
+  const initializeShortcuts = async () => {
+    const desiredPromptShortcut = promptShortcut()
+    const desiredSessionShortcuts = sessionShortcuts()
+    let registrationError: unknown
+    try {
+      await invoke('set_shortcuts', {
+        promptShortcut: desiredPromptShortcut,
+        shortcuts: desiredSessionShortcuts,
+      })
+    } catch (reason) {
+      registrationError = reason
+    }
+
+    let snapshot: ShortcutSnapshot | undefined
+    try {
+      snapshot = await invoke<ShortcutSnapshot>('get_shortcut_snapshot')
+    } catch (reason) {
+      if (registrationError) setError(`Shortcut setup failed: ${String(registrationError)}`)
+      else setError(`Could not read active shortcuts: ${String(reason)}`)
+      return
+    }
+    if (!registrationError) return
+    if (!snapshot.promptRegistered || snapshot.promptShortcut === desiredPromptShortcut) {
+      setError(`Shortcut setup failed: ${String(registrationError)}`)
+      return
+    }
+
+    const recoveredSessionShortcuts = desiredSessionShortcuts.filter(binding => (
+      !shortcutTextsMatch(binding.shortcut, snapshot.promptShortcut)
+    ))
+    const removedShortcutCount = desiredSessionShortcuts.length - recoveredSessionShortcuts.length
+    try {
+      await invoke('set_shortcuts', {
+        promptShortcut: snapshot.promptShortcut,
+        shortcuts: recoveredSessionShortcuts,
+      })
+    } catch (reason) {
+      setError(`Shortcut setup failed: ${String(reason)}`)
+      return
+    }
+
+    setPromptShortcut(snapshot.promptShortcut)
+    setSessionShortcuts(recoveredSessionShortcuts)
+    const persistent = settingsFromStorage(localStorage)
+    persistent.values[PROMPT_SHORTCUT_KEY] = snapshot.promptShortcut
+    persistent.values[SESSION_SHORTCUTS_KEY] = JSON.stringify(recoveredSessionShortcuts)
+    let persistenceError = ''
+    try {
+      await savePersistentSettings(persistent)
+    } catch (reason) {
+      persistenceError = ` Settings file update failed: ${String(reason)}`
+    }
+    localStorage.setItem(PROMPT_SHORTCUT_KEY, snapshot.promptShortcut)
+    localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(recoveredSessionShortcuts))
+    const conflictNotice = removedShortcutCount
+      ? ` Removed ${removedShortcutCount} conflicting session shortcut${removedShortcutCount === 1 ? '' : 's'}.`
+      : ''
+    setError(`Saved prompt shortcut unavailable; using ${snapshot.promptShortcut}.${conflictNotice}${persistenceError}`)
+  }
+
+  const openPreviousChat = async () => {
+    const previous = previousChat()
+    if (!previous) return
+    const transition = ++contextTransition
+    setContextChanging(true)
+    cancelVoiceInput()
+    await stopActiveTurn()
+    if (transition !== contextTransition) return
+    let contextError = ''
+    try {
+      await invoke('clear_session_shortcut_context')
+    } catch (reason) {
+      contextError = `Could not clear session shortcut context: ${String(reason)}`
+    }
+    if (transition !== contextTransition) return
+    openedFromSessionShortcut = false
+    pendingDraftSession = undefined
+    promptGeneration += 1
+    setPrompt('')
+    setCaptures([])
+    setPreview(undefined)
+    setSettingsOpen(false)
+    setError(contextError)
+    setBusy(false)
+    setStopping(false)
+    setCapturing(false)
+    setHistory(previous.history)
+    setActiveSession(previous.activeSession)
+    setRuntimeSession(previous.runtimeSession)
+    setPagedMessages([])
+    setPagedSession(undefined)
+    setHasOlderMessages(false)
+    setLoadingOlderMessages(false)
+    setLoadingSessionHistory(false)
+    setContextChanging(false)
+    scrollToLatest()
+    window.setTimeout(() => inputRef?.focus(), 20)
+  }
+
+  const openSessionShortcut = async (sessionId: string) => {
+    const currentSessionId = composerDraftSessionId(
+      activeSession(),
+      pendingDraftSession,
+      sessionSelectionValidated,
+    )
+    const hasMeaningfulState = Boolean(
+      activeTurn
+      || busy()
+      || history().length
+      || prompt()
+      || captures().length
+      || loadingSessionHistory(),
+    )
+    if (shouldPreserveSessionShortcutContext(sessionId, currentSessionId, hasMeaningfulState)) {
+      cancelVoiceInput()
+      setSettingsOpen(false)
+      setPreview(undefined)
+      setCapturing(false)
+      syncPromptLayout()
+      void loadSessions()
+      scrollToLatest()
+      window.setTimeout(() => inputRef?.focus(), 20)
+      return
+    }
+
+    const transition = ++contextTransition
+    setContextChanging(true)
+    cancelVoiceInput()
+    await stopActiveTurn()
+    if (transition !== contextTransition) return
+    const transcript = history()
+    if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
+      setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
+      void invoke('set_previous_chat_available', { available: true })
+    }
+    openedFromSessionShortcut = true
+    pendingDraftSession = undefined
+    promptGeneration += 1
+    const generation = promptGeneration
+    setPrompt('')
+    setCaptures([])
+    setPreview(undefined)
+    setSettingsOpen(false)
     setError('')
+    setBusy(false)
+    setStopping(false)
+    setCapturing(false)
+    setHistory([])
+    setLoadingSessionHistory(true)
+    setActiveSession(sessionId)
+    setRuntimeSession(undefined)
+    setPagedMessages([])
+    setPagedSession(sessionId)
+    setHasOlderMessages(false)
+    setLoadingOlderMessages(false)
+    try {
+      const page = await invoke<HistoryPage>('get_session_history_page', { sessionId, beforeId: null, limit: 40 })
+      if (transition !== contextTransition || generation !== promptGeneration) return
+      setPagedMessages(page.messages)
+      setPagedSession(sessionId)
+      setHasOlderMessages(page.has_older)
+      setHistory(transcriptFromMessages(page.messages))
+      setLoadingSessionHistory(false)
+      setContextChanging(false)
+      scrollToLatest()
+      window.setTimeout(() => inputRef?.focus(), 20)
+    } catch (reason) {
+      if (transition !== contextTransition || generation !== promptGeneration) return
+      setLoadingSessionHistory(false)
+      setContextChanging(false)
+      setError(String(reason))
+    }
   }
 
   onMount(() => {
+    resizeComposer()
+    window.addEventListener('resize', resizeComposer)
     try {
       void invoke('configure_hermes_instance', { config: currentHermesInstance() }).catch(reason => setError(String(reason)))
     } catch (reason) {
@@ -468,79 +779,30 @@ function PromptWindow() {
     }
     void loadSessions()
     void invoke<boolean>('hermes_desktop_available').then(setDesktopAvailable).catch(() => setDesktopAvailable(false))
-    void invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() }).catch(reason => setError(String(reason)))
+    void initializeShortcuts()
     const unlisten = getCurrentWindow().onFocusChanged(({ payload }) => {
       if (payload) window.setTimeout(() => inputRef?.focus(), 30)
     })
-    const unlistenOpen = listen('open-prompt', () => {
-      openedFromSessionShortcut = false
+    const unlistenOpen = listen('open-prompt', async () => {
+      // A normal launcher open starts from the configured session preference,
+      // matching the pre-background-turn behavior. Only an in-flight turn is
+      // allowed to retain its current session while hidden.
+      if (!activeTurn && !busy()) await clearPrompt(true)
       void loadSessions()
       window.setTimeout(() => inputRef?.focus(), 20)
       if (voiceAutoStart()) window.setTimeout(() => void startVoiceInput(), 40)
     })
-    const unlistenPrevious = listen('open-previous-chat', () => {
-      const previous = previousChat()
-      if (!previous) return
-      openedFromSessionShortcut = false
-      promptGeneration += 1
-      setPrompt('')
-      setCaptures([])
-      setPreview(undefined)
-      setSettingsOpen(false)
-      setError('')
-      setBusy(false)
-      setCapturing(false)
-      setHistory(previous.history)
-      setActiveSession(previous.activeSession)
-      setRuntimeSession(previous.runtimeSession)
-      setPagedMessages([])
-      setPagedSession(undefined)
-      setHasOlderMessages(false)
-      setLoadingSessionHistory(false)
-      scrollToLatest()
-      window.setTimeout(() => inputRef?.focus(), 20)
-    })
+    const unlistenPrevious = listen('open-previous-chat', () => void openPreviousChat())
     const unlistenSessionShortcut = listen<string>('open-session-shortcut', event => {
-      const sessionId = event.payload
-      const transcript = history()
-      if (shouldRememberPreviousChat(transcript.length, openedFromSessionShortcut)) {
-        setPreviousChat({ history: transcript, activeSession: activeSession(), runtimeSession: runtimeSession() })
-        void invoke('set_previous_chat_available', { available: true })
-      }
-      openedFromSessionShortcut = true
-      promptGeneration += 1
-      const generation = promptGeneration
-      setPrompt('')
-      setCaptures([])
-      setPreview(undefined)
-      setSettingsOpen(false)
-      setError('')
-      setBusy(false)
-      setCapturing(false)
-      setHistory([])
-      setLoadingSessionHistory(true)
-      setActiveSession(sessionId)
-      setRuntimeSession(undefined)
-      setPagedMessages([])
-      setPagedSession(sessionId)
-      setHasOlderMessages(false)
-      void invoke<HistoryPage>('get_session_history_page', { sessionId, beforeId: null, limit: 40 })
-        .then(page => {
-          if (generation !== promptGeneration) return
-          setPagedMessages(page.messages)
-          setPagedSession(sessionId)
-          setHasOlderMessages(page.has_older)
-          setHistory(transcriptFromMessages(page.messages))
-          setLoadingSessionHistory(false)
-          scrollToLatest()
-          window.setTimeout(() => inputRef?.focus(), 20)
-        })
-        .catch(reason => {
-          setLoadingSessionHistory(false)
-          setError(String(reason))
-        })
+      void openSessionShortcut(event.payload)
     })
-    const unlistenClear = listen('clear-prompt', clearPrompt)
+    const unlistenClear = listen('clear-prompt', () => void clearPrompt())
+    const unlistenHidden = listen('prompt-hidden', () => {
+      cancelVoiceInput()
+      setSettingsOpen(false)
+      setPreview(undefined)
+      setCapturing(false)
+    })
     const unlistenCapture = listen<Capture>('capture-complete', event => {
       setCaptures(items => appendCapture(items, event.payload))
       setCapturing(false)
@@ -560,10 +822,32 @@ function PromptWindow() {
     onCleanup(() => void unlistenPrevious.then(dispose => dispose()))
     onCleanup(() => void unlistenSessionShortcut.then(dispose => dispose()))
     onCleanup(() => void unlistenClear.then(dispose => dispose()))
+    onCleanup(() => void unlistenHidden.then(dispose => dispose()))
     onCleanup(() => void unlistenCapture.then(dispose => dispose()))
     onCleanup(() => void unlistenCaptureReady.then(dispose => dispose()))
     onCleanup(() => void unlistenSettings.then(dispose => dispose()))
     onCleanup(cancelVoiceInput)
+    onCleanup(() => {
+      window.removeEventListener('resize', resizeComposer)
+      activeTurn?.controller.abort()
+    })
+  })
+
+  createEffect(() => {
+    prompt()
+    window.requestAnimationFrame(resizeComposer)
+  })
+
+  createEffect(() => {
+    if (!sessionsReady()) return
+    const text = prompt()
+    if (!text) pendingDraftSession = undefined
+    const sessionId = composerDraftSessionId(
+      activeSession(),
+      pendingDraftSession,
+      sessionSelectionValidated,
+    )
+    draftStore.save(text ? { sessionId, text } : undefined)
   })
 
   createEffect(() => {
@@ -573,25 +857,32 @@ function PromptWindow() {
   })
 
   createEffect(() => {
-    void invoke('set_prompt_expanded', {
-      expanded: history().length > 0 || loadingSessionHistory() || Boolean(preview()) || settingsOpen(),
-      settings: settingsOpen(),
-    })
+    syncPromptLayout()
   })
 
-  const submit = async () => {
-    if (busy() || capturing() || (!prompt().trim() && captures().length === 0)) return
-    const question = prompt().trim() || 'What can you tell me about these screenshots?'
-    const images = captures()
+  const executeTurn = async (
+    question: string,
+    images: Capture[],
+    exchangeId: string,
+    appendToHistory: boolean,
+  ) => {
+    if (busy()) return
     const generation = promptGeneration
-    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const selectedSession = activeSession()
-    setHistory(items => beginExchange(items, { id: exchangeId, prompt: question, images }))
+    if (appendToHistory) {
+      setHistory(items => beginExchange(items, { id: exchangeId, prompt: question, images }))
+    }
     setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity('thinking') }))
-    setPrompt('')
-    setCaptures([])
     setBusy(true)
+    setStopping(false)
     setError('')
+    const controller = new AbortController()
+    let resolveSettled!: () => void
+    const settled = new Promise<void>(resolve => { resolveSettled = resolve })
+    const turn: ActiveTurn = { exchangeId, controller, stopping: false, settled, resolveSettled }
+    activeTurn = turn
+    const belongsToCurrentTurn = () => generation === promptGeneration && activeTurn === turn
+    const acceptsTurnOutput = () => belongsToCurrentTurn() && !turn.stopping
     try {
       const result = await runHermesTurn({
         exchangeId,
@@ -602,22 +893,23 @@ function PromptWindow() {
         model: selectedSession === NEW_SESSION ? model() || undefined : undefined,
         reasoningEffort: selectedSession === NEW_SESSION ? effort() || undefined : undefined,
         fast: selectedSession === NEW_SESSION && supportsFastMode(model()) ? fastMode() : undefined,
+        signal: controller.signal,
         onSession: (runtimeId, storedId) => {
-          if (generation !== promptGeneration) return
+          if (!belongsToCurrentTurn()) return
           setRuntimeSession(runtimeId)
           setActiveSession(storedId)
         },
         onDelta: text => {
-          if (generation !== promptGeneration) return
+          if (!acceptsTurnOutput()) return
           setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity('writing') }))
           setHistory(items => appendAnswerDelta(items, exchangeId, text))
         },
         onActivity: (kind, toolName, context) => {
-          if (generation !== promptGeneration) return
+          if (!acceptsTurnOutput()) return
           setTurnActivities(items => ({ ...items, [exchangeId]: formatTurnActivity(kind, toolName, context) }))
         },
       })
-      if (generation !== promptGeneration) return
+      if (!acceptsTurnOutput()) return
       setRuntimeSession(result.runtimeSessionId)
       setActiveSession(result.storedSessionId)
       setHistory(items => finishExchange(items, exchangeId, result.answer))
@@ -626,17 +918,45 @@ function PromptWindow() {
         window.setTimeout(() => void loadSessions(), delay)
       }
     } catch (reason) {
-      const message = String(reason)
-      setHistory(items => items.map(item => item.id === exchangeId ? { ...item, answer: item.answer || message, status: 'error' } : item))
+      if (generation !== promptGeneration) return
+      if (isHermesTurnCancelled(reason)) {
+        setHistory(items => interruptExchange(items, exchangeId))
+      } else {
+        setHistory(items => failExchange(items, exchangeId, hermesTurnErrorMessage(reason)))
+      }
     } finally {
-      setTurnActivities(items => {
-        const next = { ...items }
-        delete next[exchangeId]
-        return next
-      })
-      setBusy(false)
-      window.setTimeout(() => inputRef?.focus(), 20)
+      clearTurnActivity(exchangeId)
+      if (activeTurn === turn) {
+        activeTurn = undefined
+        setBusy(false)
+        setStopping(false)
+        window.setTimeout(() => inputRef?.focus(), 20)
+      }
+      turn.resolveSettled()
     }
+  }
+
+  const submit = async () => {
+    if (!sessionsReady() || busy() || contextChanging() || loadingSessionHistory() || capturing() || (!prompt().trim() && captures().length === 0)) return
+    const question = prompt().trim() || 'What can you tell me about these screenshots?'
+    const images = captures()
+    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    pendingDraftSession = undefined
+    setPrompt('')
+    setCaptures([])
+    await executeTurn(question, images, exchangeId, true)
+  }
+
+  const retryTurn = async (item: Exchange) => {
+    if (!sessionsReady() || busy() || contextChanging() || loadingSessionHistory() || capturing()) return
+    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    let appended = false
+    setHistory(items => {
+      const next = retryExchange(items, item.id, exchangeId)
+      appended = next !== items
+      return next
+    })
+    if (appended) await executeTurn(item.prompt, [...item.images], exchangeId, false)
   }
 
   const onKeyDown: JSX.EventHandler<HTMLTextAreaElement, KeyboardEvent> = event => {
@@ -656,7 +976,7 @@ function PromptWindow() {
   }
 
   async function beginCapture() {
-    if (capturing() || busy() || voiceStatus() !== 'idle') return
+    if (capturing() || busy() || contextChanging() || voiceStatus() !== 'idle') return
     setError('')
     setCapturing(true)
     try {
@@ -677,7 +997,9 @@ function PromptWindow() {
   }
 
   const applySettings = async () => {
+    if (busy() || contextChanging() || loadingSessionHistory()) return
     setSettingsError('')
+    let shortcutRollback: { promptShortcut: string; shortcuts: SessionShortcut[] } | undefined
     try {
       const currentAutostart = await isAutostartEnabled()
       const action = autostartAction(currentAutostart, startAtLogin())
@@ -685,7 +1007,16 @@ function PromptWindow() {
       if (action === 'disable') await disableAutostart()
       const instance = currentHermesInstance()
       await invoke('configure_hermes_instance', { config: instance })
-      await invoke('set_session_shortcuts', { shortcuts: sessionShortcuts() })
+      const nextPromptShortcut = promptShortcut()
+      const nextSessionShortcuts = sessionShortcuts()
+      shortcutRollback = {
+        promptShortcut: storedPromptShortcut(),
+        shortcuts: storedSessionShortcuts(),
+      }
+      await invoke('set_shortcuts', {
+        promptShortcut: nextPromptShortcut,
+        shortcuts: nextSessionShortcuts,
+      })
       const persistent = settingsFromStorage(localStorage)
       Object.assign(persistent.values, {
         [SESSION_PREFERENCE_KEY]: sessionPreference(),
@@ -699,9 +1030,11 @@ function PromptWindow() {
         [HERMES_ADDRESS_KEY]: hermesAddress().trim(),
         [HERMES_PORT_KEY]: hermesPort().trim(),
         [HERMES_TOKEN_KEY]: hermesToken().trim(),
-        [SESSION_SHORTCUTS_KEY]: JSON.stringify(sessionShortcuts()),
+        [PROMPT_SHORTCUT_KEY]: nextPromptShortcut,
+        [SESSION_SHORTCUTS_KEY]: JSON.stringify(nextSessionShortcuts),
       })
       await savePersistentSettings(persistent)
+      shortcutRollback = undefined
       localStorage.setItem(SESSION_PREFERENCE_KEY, sessionPreference())
       localStorage.setItem(MODEL_KEY, model())
       localStorage.setItem(EFFORT_KEY, effort())
@@ -713,13 +1046,18 @@ function PromptWindow() {
       localStorage.setItem(HERMES_ADDRESS_KEY, hermesAddress().trim())
       localStorage.setItem(HERMES_PORT_KEY, hermesPort().trim())
       localStorage.setItem(HERMES_TOKEN_KEY, hermesToken().trim())
-      localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(sessionShortcuts()))
+      localStorage.setItem(PROMPT_SHORTCUT_KEY, nextPromptShortcut)
+      localStorage.setItem(SESSION_SHORTCUTS_KEY, JSON.stringify(nextSessionShortcuts))
       if (history().length === 0) {
-        setActiveSession(sessionPreference())
+        setActiveSession(safePreferredSession())
         setRuntimeSession(undefined)
       }
       await invoke('hide_window')
     } catch (reason) {
+      if (shortcutRollback) {
+        const rollback = shortcutRollback
+        await invoke('set_shortcuts', rollback).catch(() => undefined)
+      }
       setSettingsError(String(reason))
     }
   }
@@ -730,6 +1068,11 @@ function PromptWindow() {
       toggleVoiceInput()
       return
     }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n' && !settingsOpen()) {
+      event.preventDefault()
+      void clearPrompt()
+      return
+    }
     if (event.key === 'Escape') {
       event.preventDefault()
       if (preview()) {
@@ -738,6 +1081,10 @@ function PromptWindow() {
       }
       if (settingsOpen()) {
         void invoke('hide_window')
+        return
+      }
+      if (activeTurn) {
+        void stopActiveTurn()
         return
       }
       void invoke('hide_window')
@@ -752,6 +1099,17 @@ function PromptWindow() {
 
   const updateSessionShortcut = (id: string, update: Partial<SessionShortcut>) => {
     setSessionShortcuts(items => items.map(item => item.id === id ? { ...item, ...update } : item))
+  }
+
+  const recordPromptShortcut: JSX.EventHandler<HTMLInputElement, KeyboardEvent> = event => {
+    event.preventDefault()
+    event.stopPropagation()
+    if ((event.key === 'Backspace' || event.key === 'Delete') && !event.ctrlKey && !event.altKey && !event.shiftKey && !event.metaKey) {
+      setPromptShortcut(DEFAULT_PROMPT_SHORTCUT)
+      return
+    }
+    const shortcut = shortcutFromKeyboardEvent(event)
+    if (shortcut) setPromptShortcut(shortcut)
   }
 
   const recordShortcut: JSX.EventHandler<HTMLInputElement, KeyboardEvent> = event => {
@@ -770,6 +1128,10 @@ function PromptWindow() {
     const sessionId = pagedSession()
     const existing = pagedMessages()
     if (!sessionId || !hasOlderMessages() || loadingOlderMessages() || existing.length === 0) return
+    const generation = promptGeneration
+    const beforeId = existing[0].id
+    const contextIsCurrent = () => generation === promptGeneration && pagedSession() === sessionId
+    const requestIsCurrent = () => contextIsCurrent() && pagedMessages()[0]?.id === beforeId
     const viewport = conversationRef
     const previousHeight = viewport?.scrollHeight || 0
     const storedExchangeCount = transcriptFromMessages(existing).length
@@ -777,9 +1139,10 @@ function PromptWindow() {
     try {
       const page = await invoke<HistoryPage>('get_session_history_page', {
         sessionId,
-        beforeId: existing[0].id,
+        beforeId,
         limit: 40,
       })
+      if (!requestIsCurrent()) return
       const merged = [...page.messages, ...existing]
       const liveExchanges = history().slice(storedExchangeCount)
       setPagedMessages(merged)
@@ -789,9 +1152,9 @@ function PromptWindow() {
         if (viewport) viewport.scrollTop += viewport.scrollHeight - previousHeight
       })
     } catch (reason) {
-      setError(String(reason))
+      if (requestIsCurrent()) setError(String(reason))
     } finally {
-      setLoadingOlderMessages(false)
+      if (contextIsCurrent()) setLoadingOlderMessages(false)
     }
   }
   window.addEventListener('keydown', globalKeys)
@@ -823,6 +1186,7 @@ function PromptWindow() {
               <div class="conversation-bar drag-zone" onMouseDown={startDragging} data-tauri-drag-region>
                 <span>Ask Hermes</span>
                 <div class="conversation-actions">
+                  <button title="Start a new chat (Ctrl+N)" onClick={() => void clearPrompt()}><Plus size={12} /> New chat</button>
                   <Show when={desktopAvailable()}><button onClick={openDesktop}>Open in Hermes <ExternalLink size={12} /></button></Show>
                   <button class="conversation-close" aria-label="Close Ask Hermes" title="Close" onClick={() => void invoke('hide_window')}>
                     <X size={14} />
@@ -843,12 +1207,19 @@ function PromptWindow() {
                       {item.prompt}
                     </div>
                     <Show when={item.answer}>
-                      <div class="answer markdown" classList={{ failed: item.status === 'error' }} innerHTML={renderMarkdown(item.answer)} />
+                      <div class="answer markdown" innerHTML={renderMarkdown(item.answer)} />
                     </Show>
+                    <Show when={item.status === 'error'}><div class="turn-error" role="alert">{item.error || 'Hermes turn failed'}</div></Show>
                     <Show when={item.status === 'pending'}>
                       <div class="answer-activity" role="status" aria-live="polite">
                         <LoaderCircle size={13} />
                         <span>{turnActivities()[item.id] || 'Thinking…'}</span>
+                      </div>
+                    </Show>
+                    <Show when={item.status === 'interrupted' || item.status === 'error'}>
+                      <div class="exchange-actions">
+                        <Show when={item.status === 'interrupted'}><span>Stopped</span></Show>
+                        <button type="button" disabled={busy()} onClick={() => void retryTurn(item)}>Retry</button>
                       </div>
                     </Show>
                   </article>
@@ -881,32 +1252,39 @@ function PromptWindow() {
               onPaste={onPaste}
               placeholder="Ask Hermes anything…"
               rows={1}
+              disabled={contextChanging()}
               autofocus
             />
-            <button class="capture-button" classList={{ capturing: capturing() }} onClick={beginCapture} disabled={busy() || capturing() || voiceStatus() !== 'idle'} title="Select another screen region" aria-label={capturing() ? 'Preparing screen capture' : 'Select screen region'}>
+            <button class="capture-button" classList={{ capturing: capturing() }} onClick={beginCapture} disabled={busy() || contextChanging() || capturing() || voiceStatus() !== 'idle'} title="Select another screen region" aria-label={capturing() ? 'Preparing screen capture' : 'Select screen region'}>
               <Show when={!capturing()} fallback={<span class="capture-spinner" />}>
               <Camera size={20} />
               </Show>
             </button>
-            <Show
-              when={(!prompt().trim() && captures().length === 0) || voiceStatus() !== 'idle'}
-              fallback={
-                <button class="send-button" aria-label="Ask Hermes" onClick={submit} disabled={busy() || capturing()}>
-                  <Show when={!busy()} fallback={<span class="spinner" />}><ArrowRight size={20} /></Show>
-                </button>
-              }
-            >
-              <button
-                class="voice-button"
-                classList={{ recording: voiceStatus() === 'recording' }}
-                onClick={toggleVoiceInput}
-                disabled={busy() || capturing() || voiceStatus() === 'transcribing'}
-                title={voiceInputTooltip(voiceStatus(), voiceElapsed())}
-                aria-label={voiceInputTooltip(voiceStatus(), voiceElapsed())}
+            <Show when={busy()} fallback={
+              <Show
+                when={(!prompt().trim() && captures().length === 0) || voiceStatus() !== 'idle'}
+                fallback={
+                  <button class="send-button" aria-label="Ask Hermes" onClick={submit} disabled={!sessionsReady() || contextChanging() || loadingSessionHistory() || capturing()} title={!sessionsReady() ? 'Loading Hermes sessions' : undefined}>
+                    <ArrowRight size={20} />
+                  </button>
+                }
               >
-                <Show when={voiceStatus() === 'idle'}><Mic size={20} /></Show>
-                <Show when={voiceStatus() === 'recording'}><Square size={15} /></Show>
-                <Show when={voiceStatus() === 'transcribing'}><span class="spinner" /></Show>
+                <button
+                  class="voice-button"
+                  classList={{ recording: voiceStatus() === 'recording' }}
+                  onClick={toggleVoiceInput}
+                  disabled={contextChanging() || capturing() || voiceStatus() === 'transcribing'}
+                  title={voiceInputTooltip(voiceStatus(), voiceElapsed())}
+                  aria-label={voiceInputTooltip(voiceStatus(), voiceElapsed())}
+                >
+                  <Show when={voiceStatus() === 'idle'}><Mic size={20} /></Show>
+                  <Show when={voiceStatus() === 'recording'}><Square size={15} /></Show>
+                  <Show when={voiceStatus() === 'transcribing'}><span class="spinner" /></Show>
+                </button>
+              </Show>
+            }>
+              <button class="stop-button" type="button" onClick={() => void stopActiveTurn()} disabled={stopping()} title={stopping() ? 'Stopping Hermes turn' : 'Stop turn (Esc)'} aria-label={stopping() ? 'Stopping Hermes turn' : 'Stop Hermes turn'}>
+                <Show when={!stopping()} fallback={<span class="spinner" />}><Square size={14} /></Show>
               </button>
             </Show>
           </div>
@@ -927,7 +1305,7 @@ function PromptWindow() {
                 <button classList={{ active: settingsTab() === 'general' }} onClick={() => setSettingsTab('general')}>General</button>
                 <button classList={{ active: settingsTab() === 'hermes' }} onClick={() => setSettingsTab('hermes')}>Hermes</button>
                 <button classList={{ active: settingsTab() === 'voice' }} onClick={() => setSettingsTab('voice')}>Voice input</button>
-                <button classList={{ active: settingsTab() === 'shortcuts' }} onClick={() => setSettingsTab('shortcuts')}>Session shortcuts</button>
+                <button classList={{ active: settingsTab() === 'shortcuts' }} onClick={() => setSettingsTab('shortcuts')}>Shortcuts</button>
               </nav>
               <div class="settings-body">
                 <Show when={settingsTab() === 'general'}>
@@ -949,6 +1327,7 @@ function PromptWindow() {
                       <span class="select-shell">
                         <select value={model()} onChange={event => setModel(event.currentTarget.value)}>
                           <option value="">Hermes default</option>
+                          <option value="gpt-5.6-luna">GPT-5.6 Luna · efficient / lowest cost</option>
                           <option value="gpt-5.6-terra">GPT-5.6 Terra · faster</option>
                           <option value="gpt-5.6-sol">GPT-5.6 Sol · strongest</option>
                         </select>
@@ -1039,7 +1418,32 @@ function PromptWindow() {
                   </div>
                 </Show>
                 <Show when={settingsTab() === 'shortcuts'}>
-                  <section class="shortcut-settings" aria-labelledby="shortcut-settings-title">
+                  <section class="shortcut-settings prompt-shortcut-settings" aria-labelledby="prompt-shortcut-settings-title">
+                    <div class="shortcut-settings-header">
+                      <div>
+                        <h3 id="prompt-shortcut-settings-title">Open prompt</h3>
+                        <p>Press a modified key combination. Backspace or Delete restores the default.</p>
+                      </div>
+                    </div>
+                    <div class="prompt-shortcut-row">
+                      <label for="prompt-shortcut">Global shortcut</label>
+                      <input
+                        id="prompt-shortcut"
+                        value={promptShortcut()}
+                        readOnly
+                        aria-label="Prompt shortcut keys"
+                        onKeyDown={recordPromptShortcut}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setPromptShortcut(DEFAULT_PROMPT_SHORTCUT)}
+                        disabled={promptShortcut() === DEFAULT_PROMPT_SHORTCUT}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </section>
+                  <section class="shortcut-settings session-shortcut-settings" aria-labelledby="shortcut-settings-title">
                     <div class="shortcut-settings-header">
                       <h3 id="shortcut-settings-title">Open sessions directly</h3>
                       <button type="button" onClick={addSessionShortcut} disabled={sessions().length === 0}>Add shortcut</button>
@@ -1062,7 +1466,7 @@ function PromptWindow() {
                 </Show>
               </div>
               <Show when={settingsError()}><div class="settings-error" role="alert">{settingsError()}</div></Show>
-              <footer class="settings-footer"><button class="settings-save" onClick={applySettings}>Apply</button></footer>
+              <footer class="settings-footer"><button class="settings-save" onClick={applySettings} disabled={busy() || contextChanging() || loadingSessionHistory()} title={busy() ? 'Stop the active turn before applying settings' : contextChanging() || loadingSessionHistory() ? 'Wait for the session switch to finish' : undefined}>Apply</button></footer>
             </div>
           </Show>
         </section>
@@ -1156,7 +1560,7 @@ function CaptureWindow() {
     if (event.key === 'Escape') {
       event.preventDefault()
       reset()
-      void invoke('hide_window')
+      void invoke('cancel_selection')
     }
   }
   window.addEventListener('keydown', keyDown)
